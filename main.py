@@ -9,8 +9,6 @@ from PIL import Image
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form
 from fastapi.responses import StreamingResponse, JSONResponse
 from gradio_client import Client, handle_file
-from pyngrok import ngrok
-
 # 🔑 Apka Hugging Face Token
 os.environ["HF_TOKEN"] = ""
 
