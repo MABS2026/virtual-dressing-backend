@@ -9,9 +9,9 @@ from PIL import Image
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form
 from fastapi.responses import StreamingResponse, JSONResponse
 from gradio_client import Client, handle_file
-# 🔑 Apka Hugging Face Token
-os.environ["HF_TOKEN"] = ""
 
+# 🔑 Apka Hugging Face Token (Aap yahan apna token likh sakte hain ya Railway Variables mein set kar sakte hain)
+os.environ["HF_TOKEN"] = ""
 
 nest_asyncio.apply()
 app = FastAPI()
@@ -130,13 +130,7 @@ async def skin_tone_analysis(file: UploadFile = File(...)):
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 
-# --- Server Start & Ngrok Tunneling ---
-ngrok.kill()
-tunnel = ngrok.connect(8001)
-PUBLIC_URL = tunnel.public_url
-print(f"\n🚀 NAYA LIVE BASE URL: {PUBLIC_URL}\n")
-
-config = uvicorn.Config(app, host="0.0.0.0", port=8001, loop="asyncio")
-server = uvicorn.Server(config)
-
-await server.serve()
+# --- Server Start for Railway ---
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
