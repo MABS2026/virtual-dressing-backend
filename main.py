@@ -14,8 +14,6 @@ from pyngrok import ngrok
 # 🔑 Apka Hugging Face Token
 os.environ["HF_TOKEN"] = ""
 
-# 🔑 Apka Ngrok Authtoken
-!ngrok authtoken "3LQe53HXgxOzGBcncbYsmSDmikC_3heM441norRe68yRinXgV"
 
 nest_asyncio.apply()
 app = FastAPI()
