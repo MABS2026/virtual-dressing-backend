@@ -137,14 +137,12 @@ async def predict_size(
         shoulder_in = round(shoulder_cm / 2.54, 1)
 
         # 3. Chest Circumference Estimate (2D width se 3D circumference approx)
-        # Human torso front-to-back depth ratio ke mutabiq chest circumference ~ 2.35x front shoulder/upper-torso width
         chest_cm = shoulder_cm * 2.25
         chest_in = round(chest_cm / 2.54, 1)
 
         # 4. Hip / Waist Width & Circumference
         hip_px = abs(left_hip.x - right_hip.x) * w
         hip_cm = hip_px * cm_per_pixel
-        # Waist hips se thori narrow hoti hai (approx 2.45x hip front width)
         waist_cm = hip_cm * 2.45
         waist_in = round(waist_cm / 2.54, 1)
 
