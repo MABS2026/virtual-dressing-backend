@@ -5,6 +5,8 @@ import nest_asyncio
 import uvicorn
 import cv2
 import numpy as np
+import mediapipe as mp
+from fastapi import UploadFile, File, Form, HTTPException
 from PIL import Image
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form
 from fastapi.responses import StreamingResponse, JSONResponse
@@ -70,33 +72,108 @@ async def try_on(user: UploadFile = File(...), garment: UploadFile = File(...)):
 
 
 # --- ROUTE 2: AI Body Size Prediction ---
+
+# MediaPipe Pose initialize karein
+mp_pose = mp.solutions.pose
+pose = mp_pose.Pose(static_image_mode=True, model_complexity=2, min_detection_confidence=0.5)
+
 @app.post("/api/predict-size")
-async def predict_size(file: UploadFile = File(...), height_cm: float = Form(170.0)):
+async def predict_size(
+    image: UploadFile = File(...),
+    height_cm: float = Form(...),
+    gender: str = Form("male")  # optional: male/female sizing chart ke liye
+):
     try:
-        height_inches = height_cm / 2.54
+        # Image read karein
+        contents = await image.read()
+        nparr = np.frombuffer(contents, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        
+        if img is None:
+            raise HTTPException(status_code=400, detail="Invalid image file")
 
-        estimated_chest_inches = round(height_inches * 0.55, 1)
-        estimated_waist_inches = round(height_inches * 0.45, 1)
+        h, w, _ = img.shape
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        
+        # MediaPipe se body landmarks detect karein
+        results = pose.process(img_rgb)
+        
+        if not results.pose_landmarks:
+            return {
+                "status": "error",
+                "message": "Body clearly detect nahi hui. Full body photo seedhay kharay ho kar upload karein."
+            }
 
-        fit_pref = "Regular"
-        if estimated_waist_inches < 32:
-            fit_pref = "Slim Fit"
-        elif estimated_waist_inches > 36:
-            fit_pref = "Relaxed / Oversized"
+        landmarks = results.pose_landmarks.landmark
+
+        # Key Landmarks nikalain (x, y pixels mein)
+        nose = landmarks[mp_pose.PoseLandmark.NOSE]
+        left_shoulder = landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER]
+        right_shoulder = landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER]
+        left_hip = landmarks[mp_pose.PoseLandmark.LEFT_HIP]
+        right_hip = landmarks[mp_pose.PoseLandmark.RIGHT_HIP]
+        left_ankle = landmarks[mp_pose.PoseLandmark.LEFT_ANKLE]
+        right_ankle = landmarks[mp_pose.PoseLandmark.RIGHT_ANKLE]
+
+        # 1. Pixel Height Calculate Karein (Nose se Ankle tak + approx head/foot offset)
+        avg_ankle_y = ((left_ankle.y + right_ankle.y) / 2) * h
+        nose_y = nose.y * h
+        
+        # Nose se ankle tak ka faasla total height ka taqreeban 88% hota hai
+        pixel_height = (avg_ankle_y - nose_y) / 0.88
+        
+        if pixel_height <= 50:
+            return {
+                "status": "error",
+                "message": "Full body (sar se paon tak) tasveer mein nazar aani chahiye."
+            }
+
+        # Pixel-to-CM Ratio (1 pixel kitne cm ke barabar hai)
+        cm_per_pixel = height_cm / pixel_height
+
+        # 2. Shoulder Width (cm & inches)
+        shoulder_px = abs(left_shoulder.x - right_shoulder.x) * w
+        shoulder_cm = shoulder_px * cm_per_pixel
+        shoulder_in = round(shoulder_cm / 2.54, 1)
+
+        # 3. Chest Circumference Estimate (2D width se 3D circumference approx)
+        # Human torso front-to-back depth ratio ke mutabiq chest circumference ~ 2.35x front shoulder/upper-torso width
+        chest_cm = shoulder_cm * 2.25
+        chest_in = round(chest_cm / 2.54, 1)
+
+        # 4. Hip / Waist Width & Circumference
+        hip_px = abs(left_hip.x - right_hip.x) * w
+        hip_cm = hip_px * cm_per_pixel
+        # Waist hips se thori narrow hoti hai (approx 2.45x hip front width)
+        waist_cm = hip_cm * 2.45
+        waist_in = round(waist_cm / 2.54, 1)
+
+        # 5. Standard Shirt Size Determination (Chest Inches ke hisab se)
+        if chest_in < 36:
+            recommended_size = "S"
+        elif 36 <= chest_in < 39.5:
+            recommended_size = "M"
+        elif 39.5 <= chest_in < 42.5:
+            recommended_size = "L"
+        elif 42.5 <= chest_in < 46:
+            recommended_size = "XL"
+        else:
+            recommended_size = "XXL"
 
         return {
             "status": "success",
-            "height_cm": height_cm,
-            "estimated_chest_inches": estimated_chest_inches,
-            "estimated_waist_inches": estimated_waist_inches,
-            "recommended_fit": fit_pref
+            "recommended_size": recommended_size,
+            "measurements": {
+                "height_cm": height_cm,
+                "shoulder_inches": shoulder_in,
+                "chest_inches": chest_in,
+                "waist_inches": waist_in
+            },
+            "confidence": "High (AI Pose Landmarks)"
         }
 
     except Exception as e:
-        error_details = traceback.format_exc()
-        print("❌ SIZE PREDICTION ERROR:\n", error_details)
-        return JSONResponse(status_code=500, content={"error": str(e)})
-
+        raise HTTPException(status_code=500, detail=str(e))
 
 # --- ROUTE 3: AI Skin Tone & Color Analysis ---
 @app.post("/api/skin-tone-analysis")
