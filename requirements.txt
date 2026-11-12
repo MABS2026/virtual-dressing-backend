@@ -14,3 +14,11 @@ pillow
 nest_asyncio
 python-multipart
 requests
+fastapi
+uvicorn
+python-multipart
+gradio_client
+pillow
+numpy
+opencv-python-headless
+mediapipe
