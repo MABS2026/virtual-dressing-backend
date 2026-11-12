@@ -10,15 +10,31 @@ from fastapi import FastAPI, File, UploadFile, HTTPException, Form
 from fastapi.responses import StreamingResponse, JSONResponse
 from gradio_client import Client, handle_file
 
-# 🔑 Apka Hugging Face Token (Aap yahan apna token likh sakte hain ya Railway Variables mein set kar sakte hain)
-os.environ["HF_TOKEN"] = ""
+# 🔑 Hugging Face Token (Railway Variables se uthayega)
+if os.environ.get("HF_TOKEN"):
+    os.environ["HF_TOKEN"] = os.environ.get("HF_TOKEN")
 
 nest_asyncio.apply()
 app = FastAPI()
 
-print("⏳ Connecting to IDM-VTON Model on Hugging Face...")
-client = Client("yisol/IDM-VTON")
-print("✅ Connected Successfully!")
+# Lazy loading to prevent startup crashes
+client = None
+
+def get_gradio_client():
+    global client
+    if client is None:
+        try:
+            print("⏳ Connecting to IDM-VTON Model on Hugging Face...")
+            client = Client("yisol/IDM-VTON")
+            print("✅ Connected Successfully!")
+        except Exception as e:
+            print("❌ Failed to connect to Gradio Client:", str(e))
+            raise HTTPException(status_code=500, detail="AI Model service is currently unavailable.")
+    return client
+
+@app.get("/")
+async def root():
+    return {"status": "online", "message": "Virtual Dressing Backend is running successfully!"}
 
 # --- ROUTE 1: Virtual Try-On ---
 @app.post("/api/try-on")
@@ -31,8 +47,9 @@ async def try_on(user: UploadFile = File(...), garment: UploadFile = File(...)):
             f.write(await garment.read())
 
         print("📥 Images received, sending to IDM-VTON...")
+        vton_client = get_gradio_client()
 
-        result = client.predict(
+        result = vton_client.predict(
             dict={"background": handle_file(user_path), "layers": [], "composite": None},
             garm_img=handle_file(garment_path),
             garment_des="a black cotton crewneck t-shirt with short sleeves",
@@ -92,7 +109,6 @@ async def skin_tone_analysis(file: UploadFile = File(...)):
         if img is None:
             return JSONResponse(status_code=400, content={"error": "Invalid image file"})
 
-        # Center region crop (Face area assumption)
         h, w, _ = img.shape
         center_crop = img[int(h * 0.3):int(h * 0.6), int(w * 0.3):int(w * 0.6)]
 
@@ -100,7 +116,6 @@ async def skin_tone_analysis(file: UploadFile = File(...)):
         avg_color = np.average(avg_color_per_row, axis=0)
         b, g, r = avg_color  # OpenCV uses BGR
 
-        # AI Undertone & Color Matching Logic
         if r > g and r > b:
             tone = "Warm Undertone (Medium/Olive Complexion)"
             recommended_colors = [
