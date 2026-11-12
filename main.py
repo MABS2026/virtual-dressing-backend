@@ -150,10 +150,12 @@ async def predict_size(
         chest_cm = shoulder_cm * 3.1
         chest_in = round(chest_cm / 2.54, 1)
 
-       # 4. Hip / Waist Width & Circumference
-        hip_px = abs(left_hip.x - right_hip.x) * w
+       # Smart Hybrid Formula: Asal image ka data + Realistic bounds
+        hip_px = abs(left_hip.x - right_hip.x) w
         hip_cm = hip_px * cm_per_pixel
-        waist_cm = hip_cm * 2.9
+        
+        # Multiplier ko 2.9 se barha kar 3.4 kar dein taake 2D angle compensate ho jaye
+        waist_cm = hip_cm * 3.4
         waist_in = round(waist_cm / 2.54, 1)
         # 5. Standard Shirt Size Determination (Chest Inches ke hisab se)
         if chest_in < 36:
