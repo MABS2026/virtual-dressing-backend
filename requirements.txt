@@ -5,3 +5,12 @@ gradio_client
 opencv-python-headless
 numpy
 pillow
+fastapi
+uvicorn
+gradio_client
+opencv-python-headless
+numpy
+pillow
+nest_asyncio
+python-multipart
+requests
