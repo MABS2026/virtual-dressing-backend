@@ -22,3 +22,11 @@ pillow
 numpy
 opencv-python-headless
 mediapipe
+fastapi
+uvicorn
+python-multipart
+gradio_client
+pillow
+numpy
+opencv-python-headless
+mediapipe
