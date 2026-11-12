@@ -1,8 +1,8 @@
 FROM python:3.11-slim
 
-# System libraries install karein (OpenCV aur MediaPipe ke liye)
+# System libraries install karein (Updated package names ke sath)
 RUN apt-get update && apt-get install -y \
-    libgl1-mesa-glx \
+    libgl1 \
     libglib2.0-0 \
     libxcb1 \
     libx11-xcb1 \
@@ -19,5 +19,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Baaki code copy karein
 COPY . .
 
-# Server start karein
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Server start karein (Railway ke $PORT variable ke sath)
+CMD uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}
