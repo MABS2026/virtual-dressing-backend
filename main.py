@@ -150,19 +150,17 @@ async def predict_size(
         chest_cm = shoulder_cm * 3.1
         chest_in = round(chest_cm / 2.54, 1)
 
-      # 4. Smart Hybrid Waist Calculation (Image Landmarks + Realistic Human Bounds)
+        # 4. Smart Hybrid Waist Calculation (Image Landmarks + Realistic Human Bounds)
         hip_px = abs(left_hip.x - right_hip.x) * w
         hip_cm = hip_px * cm_per_pixel
         raw_waist_in = (hip_cm * 3.8) / 2.54
 
         # Human Body Realism Guard:
-        # Normal insaan ki waist chest se maximum 7-8 inch choti hoti hai (athletic/slim),
-        # aur motay shakhs ki chest ke barabar ya 2 inch bari ho sakti hai.
         min_realistic_waist = chest_in - 7.5
         max_realistic_waist = chest_in + 2.0
 
-        # Agar MediaPipe joints ko bohat narrow pakray, to realistic range mein clamp kar dein
         waist_in = round(max(min_realistic_waist, min(raw_waist_in, max_realistic_waist)), 1)
+        
         # 5. Standard Shirt Size Determination (Chest Inches ke hisab se)
         if chest_in < 36:
             recommended_size = "S"
