@@ -71,7 +71,7 @@ async def try_on(user: UploadFile = File(...), garment: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# --- ROUTE 2: AI Body Size Prediction (Realistic & Balanced Logic) ---
+# --- ROUTE 2: AI Body Size Prediction (Accurate Physique & Proportional Logic) ---
 
 mp_pose = mp.solutions.pose
 pose = mp_pose.Pose(static_image_mode=True, model_complexity=2, min_detection_confidence=0.5)
@@ -88,7 +88,7 @@ async def predict_size(
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         
         if img is None:
-            raise HTTPException(status_code=400, detail="Invalid image file")
+            return JSONResponse(status_code=400, content={"error": "Invalid image file"})
 
         h, w, _ = img.shape
         img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
@@ -112,7 +112,7 @@ async def predict_size(
         left_ankle = landmarks[mp_pose.PoseLandmark.LEFT_ANKLE]
         right_ankle = landmarks[mp_pose.PoseLandmark.RIGHT_ANKLE]
 
-        # 1. Realistic Dynamic Confidence Score (85% to 93.5% range based on landmark visibility)
+        # 1. Realistic Confidence Score (85% to 93.5%)
         key_indices = [0, 11, 12, 23, 24, 27, 28]
         try:
             visibilities = [landmarks[i].visibility for i in key_indices]
@@ -135,30 +135,30 @@ async def predict_size(
         shoulder_px = abs(left_shoulder.x - right_shoulder.x) * w
         hip_px = abs(left_hip.x - right_hip.x) * w
 
-        # 4. BALANCED CHEST & WAIST CALCULATIONS (Fixing the 20-inch waist bug)
-        # Chest: Light bicep offset (~5%) to keep it natural
+        # 4. CHEST & WAIST CALCULATIONS
         bicep_offset_px = shoulder_px * 0.05  
         true_chest_px = shoulder_px - bicep_offset_px
         true_chest_cm = true_chest_px * cm_per_pixel
         chest_in = round((true_chest_cm * 2.7) / 2.54, 1)
 
-        # Waist: Proper proportional calculation from hip width, avoiding extremely low values
-        waist_px = hip_px * 0.90 # Minor adjustment
+        waist_px = hip_px * 0.90
         true_waist_cm = waist_px * cm_per_pixel
         waist_in = round((true_waist_cm * 2.5) / 2.54, 1)
         
-        # Ensure waist is realistically proportioned relative to height/chest if detection drops
         if waist_in < 26.0:
             waist_in = round(chest_in * 0.78, 1)
 
-        # 5. CORRECTED BODY TYPE DETECTION (Not everything is Athletic)
+        # 5. CORRECTED PHYSIQUE LOGIC (Based on actual Chest vs Waist difference)
+        chest_waist_diff = chest_in - waist_in
         ratio = shoulder_px / (hip_px if hip_px > 0 else 1)
-        if ratio > 1.25:
+
+        # Agar chest aur waist ka farq 7 inch se zyada hai aur shoulder ratio bhi barhi hai, tabhi athletic/bodybuilder hoga
+        if chest_waist_diff >= 7.5 or ratio > 1.32:
             body_type = "Athletic / V-Taper Physique 🏋️‍♂️"
-        elif ratio < 0.92:
+        elif waist_in > chest_in - 2: # Agar waist chest ke qareeb ya barhi ho
             body_type = "Comfort / Relaxed Fit 🧥"
         else:
-            body_type = "Standard / Balanced Fit ✨"
+            body_type = "Standard / Balanced Fit ✨" # Agar farq kam hai (jese chest 38, waist 32-33) toh yeh aayega
 
         # 6. DYNAMIC SHIRT SIZING
         if chest_in < 36:
@@ -197,7 +197,7 @@ async def predict_size(
                 "chest_inches": chest_in,
                 "waist_inches": waist_in
             },
-            "confidence": "High (Balanced Proportional Engine)"
+            "confidence": "High (Smart Proportional Engine)"
         }
 
     except Exception as e:
