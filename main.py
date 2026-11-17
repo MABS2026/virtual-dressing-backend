@@ -71,9 +71,8 @@ async def try_on(user: UploadFile = File(...), garment: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# --- ROUTE 2: AI Body Size Prediction ---
+# --- ROUTE 2: AI Body Size Prediction (Enhanced with Bodybuilder / V-Taper Support) ---
 
-# MediaPipe Pose initialize karein
 mp_pose = mp.solutions.pose
 pose = mp_pose.Pose(static_image_mode=True, model_complexity=2, min_detection_confidence=0.5)
 
@@ -81,10 +80,9 @@ pose = mp_pose.Pose(static_image_mode=True, model_complexity=2, min_detection_co
 async def predict_size(
     image: UploadFile = File(...),
     height_cm: float = Form(...),
-    gender: str = Form("male")  # optional: male/female sizing chart ke liye
+    gender: str = Form("male")
 ):
     try:
-        # Image read karein
         contents = await image.read()
         nparr = np.frombuffer(contents, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
@@ -95,7 +93,6 @@ async def predict_size(
         h, w, _ = img.shape
         img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         
-        # MediaPipe se body landmarks detect karein
         results = pose.process(img_rgb)
         
         if not results.pose_landmarks:
@@ -106,7 +103,6 @@ async def predict_size(
 
         landmarks = results.pose_landmarks.landmark
 
-        # Key Landmarks nikalain (x, y pixels mein)
         nose = landmarks[mp_pose.PoseLandmark.NOSE]
         left_shoulder = landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER]
         right_shoulder = landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER]
@@ -115,21 +111,19 @@ async def predict_size(
         left_ankle = landmarks[mp_pose.PoseLandmark.LEFT_ANKLE]
         right_ankle = landmarks[mp_pose.PoseLandmark.RIGHT_ANKLE]
 
-        # --- Dynamic Accuracy Calculation (Based on Landmark Visibility) ---
-        key_indices = [0, 11, 12, 23, 24, 27, 28]  # Nose, Shoulders, Hips, Ankles
+        # --- Dynamic Accuracy Calculation ---
+        key_indices = [0, 11, 12, 23, 24, 27, 28]
         try:
             visibilities = [landmarks[i].visibility for i in key_indices]
             avg_visibility = sum(visibilities) / len(visibilities)
-            # Visibility (0.0 - 1.0) ko realistic percentage (88% - 98%) mein map karein
             accuracy_percentage = round(88.0 + (avg_visibility * 10.0), 1)
         except Exception:
             accuracy_percentage = 92.4
 
-        # 1. Pixel Height Calculate Karein (Nose se Ankle tak + approx head/foot offset)
+        # 1. Pixel Height Calculate Karein
         avg_ankle_y = ((left_ankle.y + right_ankle.y) / 2) * h
         nose_y = nose.y * h
         
-        # Nose se ankle tak ka faasla total height ka taqreeban 88% hota hai
         pixel_height = (avg_ankle_y - nose_y) / 0.88
         
         if pixel_height <= 50:
@@ -138,56 +132,85 @@ async def predict_size(
                 "message": "Full body (sar se paon tak) tasveer mein nazar aani chahiye."
             }
 
-        # Pixel-to-CM Ratio (1 pixel kitne cm ke barabar hai)
         cm_per_pixel = height_cm / pixel_height
 
-        # 2. Shoulder Width (cm & inches)
+        # 2. Shoulder Width & Chest Calculation
         shoulder_px = abs(left_shoulder.x - right_shoulder.x) * w
         shoulder_cm = shoulder_px * cm_per_pixel
         shoulder_in = round(shoulder_cm / 2.54, 1)
 
-        # 3. Chest Circumference Estimate (2D width se 3D circumference approx)
         chest_cm = shoulder_cm * 3.1
         chest_in = round(chest_cm / 2.54, 1)
 
-        # 4. Smart Hybrid Waist Calculation (Image Landmarks + Realistic Human Bounds)
+        # 3. Hip & Waist Calculation
         hip_px = abs(left_hip.x - right_hip.x) * w
         hip_cm = hip_px * cm_per_pixel
         raw_waist_in = (hip_cm * 3.8) / 2.54
 
-        # Human Body Realism Guard:
-        min_realistic_waist = chest_in - 7.5
-        max_realistic_waist = chest_in + 2.0
+        # 4. Bodybuilder / V-Taper Proportion Check (Shoulder-to-Hip Ratio)
+        shoulder_to_hip_ratio = shoulder_px / (hip_px if hip_px > 0 else 1)
 
-        waist_in = round(max(min_realistic_waist, min(raw_waist_in, max_realistic_waist)), 1)
-        
-        # 5. Standard Shirt Size Determination (Chest Inches ke hisab se)
-        if chest_in < 36:
-            recommended_size = "S"
-        elif 36 <= chest_in < 39.5:
-            recommended_size = "M"
-        elif 39.5 <= chest_in < 42.5:
-            recommended_size = "L"
-        elif 42.5 <= chest_in < 46:
-            recommended_size = "XL"
+        if shoulder_to_hip_ratio > 1.30:
+            body_type = "Athletic / Bodybuilder V-Taper"
+            chest_in = max(chest_in, 44.0)
+            waist_in = min(raw_waist_in, 34.0)
+        elif shoulder_to_hip_ratio < 1.05:
+            body_type = "Relaxed / Comfort Fit"
+            waist_in = raw_waist_in
         else:
-            recommended_size = "XXL"
+            body_type = "Standard / Balanced Fit"
+            min_realistic_waist = chest_in - 7.5
+            max_realistic_waist = chest_in + 2.0
+            waist_in = max(min_realistic_waist, min(raw_waist_in, max_realistic_waist))
+
+        chest_in = round(chest_in, 1)
+        waist_in = round(waist_in, 1)
+
+        # 5. Standard Shirt Size Determination
+        if chest_in < 36:
+            recommended_size = "S (Small)"
+        elif 36 <= chest_in < 39.5:
+            recommended_size = "M (Medium)"
+        elif 39.5 <= chest_in < 42.5:
+            recommended_size = "L (Large)"
+        elif 42.5 <= chest_in < 46:
+            recommended_size = "XL (Extra Large)"
+        else:
+            recommended_size = "XXL (Double Extra Large)"
+
+        # 6. Pant / Waist Size Determination
+        if waist_in <= 30:
+            pant_size = "30 (Small)"
+        elif waist_in <= 32:
+            pant_size = "32 (Medium)"
+        elif waist_in <= 34:
+            pant_size = "34 (Large - Athletic)"
+        elif waist_in <= 38:
+            pant_size = "38 (XL)"
+        else:
+            pant_size = "40+ (XXL)"
 
         return {
             "status": "success",
+            "body_type": body_type,
             "recommended_size": recommended_size,
+            "recommended_shirt_size": recommended_size,
+            "recommended_pant_size": pant_size,
+            "accuracy_percentage": accuracy_percentage,
             "measurements": {
                 "height_cm": height_cm,
                 "shoulder_inches": shoulder_in,
                 "chest_inches": chest_in,
                 "waist_inches": waist_in
             },
-            "accuracy_percentage": accuracy_percentage,
             "confidence": "High (AI Pose Landmarks)"
         }
 
     except Exception as e:
+        error_details = traceback.format_exc()
+        print("❌ SIZE PREDICTION ERROR:\n", error_details)
         raise HTTPException(status_code=500, detail=str(e))
+
 
 # --- ROUTE 3: AI Skin Tone & Color Analysis ---
 @app.post("/api/skin-tone-analysis")
