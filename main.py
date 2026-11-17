@@ -71,7 +71,7 @@ async def try_on(user: UploadFile = File(...), garment: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# --- ROUTE 2: AI Body Size Prediction (Accurate Physique & Proportional Logic) ---
+# --- ROUTE 2: AI Body Size Prediction (Strict Physique Classification) ---
 
 mp_pose = mp.solutions.pose
 pose = mp_pose.Pose(static_image_mode=True, model_complexity=2, min_detection_confidence=0.5)
@@ -148,17 +148,15 @@ async def predict_size(
         if waist_in < 26.0:
             waist_in = round(chest_in * 0.78, 1)
 
-        # 5. CORRECTED PHYSIQUE LOGIC (Based on actual Chest vs Waist difference)
+        # 5. STRICT PHYSIQUE LOGIC (Must have >= 8.5 inch difference to be Athletic)
         chest_waist_diff = chest_in - waist_in
-        ratio = shoulder_px / (hip_px if hip_px > 0 else 1)
 
-        # Agar chest aur waist ka farq 7 inch se zyada hai aur shoulder ratio bhi barhi hai, tabhi athletic/bodybuilder hoga
-        if chest_waist_diff >= 7.5 or ratio > 1.32:
+        if chest_waist_diff >= 8.5:
             body_type = "Athletic / V-Taper Physique 🏋️‍♂️"
-        elif waist_in > chest_in - 2: # Agar waist chest ke qareeb ya barhi ho
+        elif waist_in >= chest_in - 1.5:
             body_type = "Comfort / Relaxed Fit 🧥"
         else:
-            body_type = "Standard / Balanced Fit ✨" # Agar farq kam hai (jese chest 38, waist 32-33) toh yeh aayega
+            body_type = "Standard / Balanced Fit ✨"
 
         # 6. DYNAMIC SHIRT SIZING
         if chest_in < 36:
@@ -197,7 +195,7 @@ async def predict_size(
                 "chest_inches": chest_in,
                 "waist_inches": waist_in
             },
-            "confidence": "High (Smart Proportional Engine)"
+            "confidence": "High (Strict Proportional Engine)"
         }
 
     except Exception as e:
