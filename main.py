@@ -71,7 +71,7 @@ async def try_on(user: UploadFile = File(...), garment: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# --- ROUTE 2: AI Body Size Prediction (Dynamic Percentage Offset - No Hardcoding) ---
+# --- ROUTE 2: AI Body Size Prediction (Balanced Dynamic Offset - No Crash) ---
 
 mp_pose = mp.solutions.pose
 pose = mp_pose.Pose(static_image_mode=True, model_complexity=2, min_detection_confidence=0.5)
@@ -126,21 +126,21 @@ async def predict_size(
         shoulder_px = abs(left_shoulder.x - right_shoulder.x) * w
         hip_px = abs(left_hip.x - right_hip.x) * w
 
-        # 3. DYNAMIC CHEST CALCULATION (Minus Biceps/Arms Offset ~20%)
-        bicep_offset_px = shoulder_px * 0.20  
+        # 3. BALANCED CHEST CALCULATION (Light Bicep Offset ~7% only)
+        bicep_offset_px = shoulder_px * 0.07  
         true_chest_px = shoulder_px - bicep_offset_px
         
         true_chest_cm = true_chest_px * cm_per_pixel
-        chest_in = round((true_chest_cm * 2.4) / 2.54, 1)
+        chest_in = round((true_chest_cm * 2.8) / 2.54, 1)
 
-        # 4. DYNAMIC WAIST CALCULATION (Minus Arms/Hands Offset at Waist Level ~18%)
-        waist_offset_px = hip_px * 0.18
+        # 4. BALANCED WAIST CALCULATION (Light Waist Offset ~8% only)
+        waist_offset_px = hip_px * 0.08
         true_waist_px = hip_px - waist_offset_px
         
         true_waist_cm = true_waist_px * cm_per_pixel
-        waist_in = round((true_waist_cm * 2.3) / 2.54, 1)
+        waist_in = round((true_waist_cm * 2.6) / 2.54, 1)
 
-        # 5. NATURAL BODY TYPE DETECTION (Based purely on individual proportions)
+        # 5. NATURAL BODY TYPE DETECTION
         ratio = shoulder_px / (hip_px if hip_px > 0 else 1)
         if ratio > 1.30:
             body_type = "Athletic / V-Taper Physique 🏋️‍♂️"
@@ -149,7 +149,7 @@ async def predict_size(
         else:
             body_type = "Standard / Balanced Fit ✨"
 
-        # 6. DYNAMIC SHIRT SIZING (No hardcoding, purely based on calculated chest_in)
+        # 6. DYNAMIC SHIRT SIZING
         if chest_in < 36:
             recommended_size = "S (Small)"
         elif 36 <= chest_in < 39.5:
@@ -161,7 +161,7 @@ async def predict_size(
         else:
             recommended_size = "XXL (Double Extra Large)"
 
-        # 7. DYNAMIC PANT / WAIST SIZING (Purely based on calculated waist_in)
+        # 7. DYNAMIC PANT / WAIST SIZING
         if waist_in <= 30:
             pant_size = "30 (Small)"
         elif waist_in <= 33:
@@ -186,7 +186,7 @@ async def predict_size(
                 "chest_inches": chest_in,
                 "waist_inches": waist_in
             },
-            "confidence": "High (Dynamic Offset Calculation Engine)"
+            "confidence": "High (Balanced Dynamic Offset Engine)"
         }
 
     except Exception as e:
