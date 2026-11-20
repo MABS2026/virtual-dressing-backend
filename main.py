@@ -2,7 +2,7 @@ import os
 import io
 import math
 import traceback
-from typing import Optional
+from typing import Optional, Tuple
 import nest_asyncio
 import uvicorn
 import cv2
@@ -41,8 +41,8 @@ def get_gradio_client():
 
 def ellipse_circumference_cm(width_cm: float, depth_cm: float) -> float:
     """
-    Calculates ellipse circumference in cm given full width and full depth.
-    Uses semi-axes a = width / 2 and b = depth / 2.
+    Ramanujan's approximation for ellipse circumference in cm given full width and full depth.
+    Semi-axes: a = width / 2, b = depth / 2.
     """
     a = max(width_cm / 2.0, 0.1)
     b = max(depth_cm / 2.0, 0.1)
@@ -99,15 +99,103 @@ async def try_on(user: UploadFile = File(...), garment: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# --- ROUTE 2: AI Body Size Prediction (Front + Optional Side Ellipse + Weight/BMI) ---
+# --- ROUTE 2: AI Body Size Prediction (Segmentation + Pose + Front/Side Ellipse) ---
 
 mp_pose = mp.solutions.pose
 pose = mp_pose.Pose(
     static_image_mode=True, model_complexity=2, min_detection_confidence=0.5
 )
 
+mp_selfie_seg = mp.solutions.selfie_segmentation
+selfie_seg = mp_selfie_seg.SelfieSegmentation(model_selection=1)
 
-def extract_pose_metrics(image_bytes: bytes, height_cm: float):
+
+def get_body_segmentation_mask(img_bgr: np.ndarray, img_rgb: np.ndarray) -> np.ndarray:
+    """
+    Produces a cleaned binary foreground mask (values 0 or 255) for the person.
+    Keeps the largest connected component around the center/body to reduce background noise.
+    """
+    h, w, _ = img_rgb.shape
+    seg_res = selfie_seg.process(img_rgb)
+
+    if seg_res.segmentation_mask is not None:
+        mask = (seg_res.segmentation_mask > 0.45).astype(np.uint8) * 255
+    else:
+        mask = np.zeros((h, w), dtype=np.uint8)
+
+    # Morphological cleanup to fill small gaps and remove tiny speckles
+    kernel = np.ones((5, 5), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask)
+    if num_labels > 1:
+        # Ignore background label 0; pick largest component
+        best_label = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+        area = stats[best_label, cv2.CC_STAT_AREA]
+        if area > (h * w * 0.02):
+            mask = np.where(labels == best_label, 255, 0).astype(np.uint8)
+
+    return mask
+
+
+def measure_mask_span_at_y(
+    mask: np.ndarray,
+    y_center: int,
+    x_min_hint: Optional[int] = None,
+    x_max_hint: Optional[int] = None,
+    band_half: int = 6,
+) -> Optional[float]:
+    """
+    Measures horizontal pixel span of the body mask near row y_center.
+    If pose x hints are provided, prefers the contiguous foreground segment overlapping them.
+    """
+    h, w = mask.shape
+    y0 = max(0, y_center - band_half)
+    y1 = min(h, y_center + band_half + 1)
+    if y0 >= y1:
+        return None
+
+    band = (mask[y0:y1, :] > 0).astype(np.uint8)
+    # Row profile: pixel present in at least half of the band rows
+    min_votes = max(1, band.shape[0] // 2)
+    row_active = (np.sum(band, axis=0) >= min_votes).astype(np.uint8)
+
+    if np.sum(row_active) == 0:
+        return None
+
+    # Find contiguous runs in row_active
+    padded = np.concatenate(([0], row_active, [0]))
+    diffs = np.diff(padded)
+    starts = np.where(diffs == 1)[0]
+    ends = np.where(diffs == -1)[0]
+
+    if len(starts) == 0:
+        return None
+
+    if x_min_hint is not None and x_max_hint is not None:
+        hint_cx = 0.5 * (x_min_hint + x_max_hint)
+        best_span = None
+        best_score = float("inf")
+        for s, e in zip(starts, ends):
+            span = float(e - s)
+            if span < 4:
+                continue
+            seg_cx = 0.5 * (s + e)
+            # Check overlap with pose horizontal region
+            overlaps = not (e < x_min_hint or s > x_max_hint)
+            dist = abs(seg_cx - hint_cx) + (0.0 if overlaps else w * 0.5)
+            if dist < best_score:
+                best_score = dist
+                best_span = span
+        if best_span is not None:
+            return best_span
+
+    xs = np.where(row_active > 0)[0]
+    return float(xs[-1] - xs[0] + 1) if len(xs) > 0 else None
+
+
+def extract_body_metrics(image_bytes: bytes, height_cm: float) -> Tuple[Optional[dict], Optional[str]]:
     nparr = np.frombuffer(image_bytes, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
@@ -116,34 +204,38 @@ def extract_pose_metrics(image_bytes: bytes, height_cm: float):
 
     h, w, _ = img.shape
     img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    results = pose.process(img_rgb)
+    pose_results = pose.process(img_rgb)
 
-    if not results.pose_landmarks:
+    if not pose_results.pose_landmarks:
         return (
             None,
             "Body clearly detect nahi hui. Full body photo seedhay kharay ho kar upload karein.",
         )
 
-    landmarks = results.pose_landmarks.landmark
+    landmarks = pose_results.pose_landmarks.landmark
+    mask = get_body_segmentation_mask(img, img_rgb)
 
-    nose = landmarks[mp_pose.PoseLandmark.NOSE]
-    left_shoulder = landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER]
-    right_shoulder = landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER]
-    left_hip = landmarks[mp_pose.PoseLandmark.LEFT_HIP]
-    right_hip = landmarks[mp_pose.PoseLandmark.RIGHT_HIP]
-    left_ankle = landmarks[mp_pose.PoseLandmark.LEFT_ANKLE]
-    right_ankle = landmarks[mp_pose.PoseLandmark.RIGHT_ANKLE]
-
-    avg_ankle_y = ((left_ankle.y + right_ankle.y) / 2.0) * h
-    nose_y = nose.y * h
-    # Nose to ankle is roughly ~84% of full head-to-sole height
-    pixel_height = max((avg_ankle_y - nose_y) / 0.84, 1.0)
+    # 1. Segmentation-based top-to-bottom body height
+    ys, _ = np.where(mask > 0)
+    if len(ys) > 20:
+        seg_top_y = float(np.min(ys))
+        seg_bottom_y = float(np.max(ys))
+        pixel_height = seg_bottom_y - seg_top_y
+    else:
+        # Fallback if segmentation mask is sparse
+        nose = landmarks[mp_pose.PoseLandmark.NOSE]
+        left_ankle = landmarks[mp_pose.PoseLandmark.LEFT_ANKLE]
+        right_ankle = landmarks[mp_pose.PoseLandmark.RIGHT_ANKLE]
+        avg_ankle_y = ((left_ankle.y + right_ankle.y) / 2.0) * h
+        nose_y = nose.y * h
+        pixel_height = max((avg_ankle_y - nose_y) / 0.84, 1.0)
 
     if pixel_height <= 50:
         return None, "Full body photo upload karein."
 
     cm_per_pixel = height_cm / pixel_height
 
+    # Pose visibility score
     key_indices = [0, 11, 12, 23, 24, 27, 28]
     try:
         visibilities = [landmarks[i].visibility for i in key_indices]
@@ -151,18 +243,60 @@ def extract_pose_metrics(image_bytes: bytes, height_cm: float):
     except Exception:
         avg_vis = 0.5
 
-    landmark_shoulder_px = abs(left_shoulder.x - right_shoulder.x) * w
-    landmark_hip_px = abs(left_hip.x - right_hip.x) * w
+    # Pose landmarks for vertical level anchoring
+    left_shoulder = landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER]
+    right_shoulder = landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER]
+    left_hip = landmarks[mp_pose.PoseLandmark.LEFT_HIP]
+    right_hip = landmarks[mp_pose.PoseLandmark.RIGHT_HIP]
 
-    avg_shoulder_y = ((left_shoulder.y + right_shoulder.y) / 2.0) * h
-    avg_hip_y = ((left_hip.y + right_hip.y) / 2.0) * h
-    torso_len_cm = max(abs(avg_hip_y - avg_shoulder_y) * cm_per_pixel, 1.0)
+    sh_x1, sh_x2 = sorted([int(left_shoulder.x * w), int(right_shoulder.x * w)])
+    hip_x1, hip_x2 = sorted([int(left_hip.x * w), int(right_hip.x * w)])
+
+    avg_shoulder_y = int(round(((left_shoulder.y + right_shoulder.y) / 2.0) * h))
+    avg_hip_y = int(round(((left_hip.y + right_hip.y) / 2.0) * h))
+
+    # Chest level is slightly below shoulder line (~28% of shoulder-to-hip distance)
+    torso_px = max(abs(avg_hip_y - avg_shoulder_y), 1)
+    chest_y = int(np.clip(avg_shoulder_y + int(torso_px * 0.28), 0, h - 1))
+    # Natural waist is roughly ~62% down from shoulder toward hip
+    waist_y = int(np.clip(avg_shoulder_y + int(torso_px * 0.62), 0, h - 1))
+
+    # Horizontal span from segmentation mask (with pose fallback)
+    pose_sh_span = max(abs(sh_x2 - sh_x1), 1)
+    pose_hip_span = max(abs(hip_x2 - hip_x1), 1)
+
+    sh_hint_min = max(0, sh_x1 - int(pose_sh_span * 0.35))
+    sh_hint_max = min(w, sh_x2 + int(pose_sh_span * 0.35))
+    hip_hint_min = max(0, hip_x1 - int(pose_hip_span * 0.35))
+    hip_hint_max = min(w, hip_x2 + int(pose_hip_span * 0.35))
+
+    shoulder_px = measure_mask_span_at_y(
+        mask, avg_shoulder_y, sh_hint_min, sh_hint_max, band_half=5
+    ) or (pose_sh_span * 1.18)
+
+    chest_px = measure_mask_span_at_y(
+        mask, chest_y, sh_hint_min, sh_hint_max, band_half=6
+    ) or (shoulder_px * 0.92)
+
+    waist_px = measure_mask_span_at_y(
+        mask, waist_y, hip_hint_min, hip_hint_max, band_half=6
+    ) or (pose_hip_span * 1.15)
+
+    # For a side-view photo, horizontal mask span represents body depth at that level
+    side_chest_depth_px = measure_mask_span_at_y(mask, chest_y, band_half=6)
+    side_waist_depth_px = measure_mask_span_at_y(mask, waist_y, band_half=6)
 
     return {
         "cm_per_pixel": cm_per_pixel,
-        "landmark_shoulder_px": landmark_shoulder_px,
-        "landmark_hip_px": landmark_hip_px,
-        "torso_len_cm": torso_len_cm,
+        "shoulder_cm": shoulder_px * cm_per_pixel,
+        "chest_width_cm": chest_px * cm_per_pixel,
+        "waist_width_cm": waist_px * cm_per_pixel,
+        "side_chest_depth_cm": (
+            side_chest_depth_px * cm_per_pixel if side_chest_depth_px else None
+        ),
+        "side_waist_depth_cm": (
+            side_waist_depth_px * cm_per_pixel if side_waist_depth_px else None
+        ),
         "avg_vis": avg_vis,
     }, None
 
@@ -172,41 +306,6 @@ def compute_bmi(height_cm: float, weight_kg: Optional[float]) -> Optional[float]
         return None
     height_m = height_cm / 100.0
     return round(weight_kg / (height_m * height_m), 1)
-
-
-def apply_weight_bmi_calibration(
-    chest_in: float,
-    waist_in: float,
-    bmi: Optional[float],
-    shoulder_in: float,
-):
-    """
-    General BMI-based calibration across any height and weight.
-    Uses BMI ~22.0 as neutral reference and adjusts chest & waist proportionally.
-    """
-    if bmi is None:
-        return chest_in, waist_in, None
-
-    bmi_delta = bmi - 22.0
-
-    # General continuous adjustment (no single height/weight hardcoded)
-    chest_adj = chest_in + (bmi_delta * 0.45)
-    waist_adj = waist_in + (bmi_delta * 0.40)
-
-    chest_final = round(float(np.clip(chest_adj, 28.0, 62.0)), 1)
-    waist_final = round(float(np.clip(waist_adj, 24.0, 56.0)), 1)
-
-    shoulder_waist_diff = shoulder_in - waist_final
-    if shoulder_waist_diff >= 6.5 and bmi < 27.5:
-        physique = "Athletic / V-Taper Physique 🏋️‍♂️"
-    elif bmi < 18.5:
-        physique = "Lean / Slim Build 🏃"
-    elif waist_final >= chest_final - 1.5 or bmi >= 28.0:
-        physique = "Comfort / Relaxed Fit 🧥"
-    else:
-        physique = "Standard / Balanced Fit ✨"
-
-    return chest_final, waist_final, physique
 
 
 @app.post("/api/predict-size")
@@ -219,55 +318,34 @@ async def predict_size(
 ):
     try:
         front_bytes = await image.read()
-        front_data, front_err = extract_pose_metrics(front_bytes, height_cm)
+        front_data, front_err = extract_body_metrics(front_bytes, height_cm)
         if front_err:
             if front_err == "Invalid image file":
                 return JSONResponse(status_code=400, content={"error": front_err})
             return {"status": "error", "message": front_err}
 
-        cm_per_pixel = front_data["cm_per_pixel"]
-        torso_len_cm = front_data["torso_len_cm"]
+        chest_width_cm = front_data["chest_width_cm"]
+        waist_width_cm = front_data["waist_width_cm"]
+        shoulder_cm = front_data["shoulder_cm"]
         avg_vis = front_data["avg_vis"]
 
-        bmi_val = compute_bmi(height_cm, weight_kg)
-        # Depth ratio scales smoothly with BMI around 0.62 (neutral BMI 22.0)
-        depth_ratio = float(
-            np.clip(0.62 + ((bmi_val - 22.0) * 0.012 if bmi_val is not None else 0.0), 0.54, 0.78)
-        )
-
-        # Convert inner MediaPipe landmarks to approximate outer body widths (cm)
-        outer_shoulder_cm = max(
-            front_data["landmark_shoulder_px"] * cm_per_pixel * 1.18, 25.0
-        )
-        chest_width_cm = max(outer_shoulder_cm * 0.90, 22.0)
-
-        outer_hip_cm = max(
-            front_data["landmark_hip_px"] * cm_per_pixel * 1.22, 22.0
-        )
-        waist_width_cm = max(outer_hip_cm * 0.90, 20.0)
-
         used_dual_photo = False
-        side_note = "Single-photo proportional estimation"
+        side_note = "Front segmentation proportional depth estimation"
 
         if side_image is not None and side_image.filename:
             side_bytes = await side_image.read()
             if side_bytes:
-                side_data, side_err = extract_pose_metrics(side_bytes, height_cm)
+                side_data, side_err = extract_body_metrics(side_bytes, height_cm)
                 if side_data is not None:
-                    side_torso_cm = side_data["torso_len_cm"]
-                    ref_torso_cm = 0.5 * (torso_len_cm + side_torso_cm)
+                    chest_depth_cm = side_data["side_chest_depth_cm"] or (
+                        chest_width_cm * 0.65
+                    )
+                    waist_depth_cm = side_data["side_waist_depth_cm"] or (
+                        waist_width_cm * 0.68
+                    )
 
-                    # Tie chest depth to chest_width_cm & depth_ratio so tall frames don't inflate depth
-                    chest_depth_cm = float(
-                        np.clip(chest_width_cm * depth_ratio, 16.0, 34.0)
-                    )
-                    waist_depth_cm = float(
-                        np.clip(
-                            max(waist_width_cm * (depth_ratio * 0.95), ref_torso_cm * 0.44),
-                            15.0,
-                            34.0,
-                        )
-                    )
+                    chest_depth_cm = float(np.clip(chest_depth_cm, 15.0, 42.0))
+                    waist_depth_cm = float(np.clip(waist_depth_cm, 14.0, 42.0))
 
                     chest_circ_cm = ellipse_circumference_cm(
                         chest_width_cm, chest_depth_cm
@@ -281,52 +359,58 @@ async def predict_size(
 
                     avg_vis = (avg_vis + side_data["avg_vis"]) / 2.0
                     used_dual_photo = True
-                    side_note = "Dual-photo (Front + Side) Ellipse estimation"
+                    side_note = "Front + Side segmentation ellipse estimation"
                 else:
-                    chest_in = round((chest_width_cm * 2.45) / 2.54, 1)
-                    waist_in = round((waist_width_cm * 2.40) / 2.54, 1)
+                    chest_depth_cm = chest_width_cm * 0.65
+                    waist_depth_cm = waist_width_cm * 0.68
+                    chest_in = round(
+                        ellipse_circumference_cm(chest_width_cm, chest_depth_cm)
+                        / 2.54,
+                        1,
+                    )
+                    waist_in = round(
+                        ellipse_circumference_cm(waist_width_cm, waist_depth_cm)
+                        / 2.54,
+                        1,
+                    )
             else:
-                chest_in = round((chest_width_cm * 2.45) / 2.54, 1)
-                waist_in = round((waist_width_cm * 2.40) / 2.54, 1)
+                chest_depth_cm = chest_width_cm * 0.65
+                waist_depth_cm = waist_width_cm * 0.68
+                chest_in = round(
+                    ellipse_circumference_cm(chest_width_cm, chest_depth_cm) / 2.54,
+                    1,
+                )
+                waist_in = round(
+                    ellipse_circumference_cm(waist_width_cm, waist_depth_cm) / 2.54,
+                    1,
+                )
         else:
-            chest_in = round((chest_width_cm * 2.45) / 2.54, 1)
-            waist_in = round((waist_width_cm * 2.40) / 2.54, 1)
-
-        if waist_in < 26.0:
-            waist_in = round(max(28.0, chest_in * 0.80), 1)
-
-        shoulder_in = round(outer_shoulder_cm / 2.54, 1)
-
-        # Apply general Weight + BMI calibration when BMI is available
-        calibrated_physique = None
-        if bmi_val is not None:
-            chest_in, waist_in, calibrated_physique = apply_weight_bmi_calibration(
-                chest_in=chest_in,
-                waist_in=waist_in,
-                bmi=bmi_val,
-                shoulder_in=shoulder_in,
+            chest_depth_cm = chest_width_cm * 0.65
+            waist_depth_cm = waist_width_cm * 0.68
+            chest_in = round(
+                ellipse_circumference_cm(chest_width_cm, chest_depth_cm) / 2.54, 1
             )
-            side_note = f"{side_note} + Weight/BMI calibrated"
+            waist_in = round(
+                ellipse_circumference_cm(waist_width_cm, waist_depth_cm) / 2.54, 1
+            )
 
-        weight_bonus = 1.5 if bmi_val is not None else 0.0
-        base_conf = (
-            85.0 + (avg_vis * 8.0) + (0.5 if used_dual_photo else 0.0) + weight_bonus
-        )
-        accuracy_percentage = round(min(max(base_conf, 85.0), 94.5), 1)
+        shoulder_in = round(shoulder_cm / 2.54, 1)
+        bmi_val = compute_bmi(height_cm, weight_kg)
 
-        # 5. PHYSIQUE CLASSIFICATION
-        if calibrated_physique is not None:
-            body_type = calibrated_physique
+        # Confidence reflects pose visibility & dual-photo availability (not a claim of ground-truth accuracy)
+        conf_score = 80.0 + (avg_vis * 10.0) + (2.0 if used_dual_photo else 0.0)
+        accuracy_percentage = round(min(max(conf_score, 80.0), 92.5), 1)
+
+        # Physique classification from measured proportions (with BMI only as supporting note if available)
+        chest_waist_diff = chest_in - waist_in
+        if chest_waist_diff >= 7.5:
+            body_type = "Athletic / V-Taper Physique 🏋️‍♂️"
+        elif waist_in >= chest_in - 1.5:
+            body_type = "Comfort / Relaxed Fit 🧥"
         else:
-            chest_waist_diff = chest_in - waist_in
-            if chest_waist_diff >= 8.5:
-                body_type = "Athletic / V-Taper Physique 🏋️‍♂️"
-            elif waist_in >= chest_in - 1.5:
-                body_type = "Comfort / Relaxed Fit 🧥"
-            else:
-                body_type = "Standard / Balanced Fit ✨"
+            body_type = "Standard / Balanced Fit ✨"
 
-        # 6. DYNAMIC SHIRT SIZING
+        # Shirt sizing from chest circumference
         if chest_in < 36:
             recommended_size = "S (Small)"
         elif 36 <= chest_in < 39.5:
@@ -338,7 +422,7 @@ async def predict_size(
         else:
             recommended_size = "XXL (Double Extra Large)"
 
-        # 7. DYNAMIC PANT / WAIST SIZING
+        # Pant / waist sizing from waist circumference
         if waist_in <= 31:
             pant_size = "30-32 (Small)"
         elif waist_in <= 34:
@@ -370,7 +454,8 @@ async def predict_size(
             "accuracy_percentage": accuracy_percentage,
             "dual_photo_used": used_dual_photo,
             "measurements": measurements_payload,
-            "confidence": f"High ({side_note})",
+            "confidence": f"Pose/Mask Quality ({side_note})",
+            "note": "Loose garments can affect outer boundary width/depth; validate against tape measurements.",
         }
 
     except Exception as e:
