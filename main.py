@@ -99,7 +99,7 @@ async def try_on(user: UploadFile = File(...), garment: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# --- ROUTE 2: AI Body Size Prediction (Front + Optional Side Ellipse) ---
+# --- ROUTE 2: AI Body Size Prediction (Front + Optional Side Ellipse + Weight/BMI) ---
 
 mp_pose = mp.solutions.pose
 pose = mp_pose.Pose(
@@ -167,11 +167,52 @@ def extract_pose_metrics(image_bytes: bytes, height_cm: float):
     }, None
 
 
+def apply_weight_bmi_calibration(
+    chest_in: float,
+    waist_in: float,
+    height_cm: float,
+    weight_kg: Optional[float],
+    shoulder_in: float,
+):
+    """
+    Calibrates chest & waist circumference estimates using weight_kg and BMI
+    when a valid weight is provided.
+    """
+    if weight_kg is None or weight_kg <= 0 or height_cm <= 0:
+        return chest_in, waist_in, None, None
+
+    height_m = height_cm / 100.0
+    bmi = round(weight_kg / (height_m * height_m), 1)
+
+    # Baseline BMI ~22.0: gently adjust chest & waist based on weight/BMI delta
+    bmi_delta = bmi - 22.0
+
+    # Blend 75% vision-derived estimate + 25% weight-calibrated adjustment
+    chest_adj = chest_in + (bmi_delta * 0.30)
+    waist_adj = waist_in + (bmi_delta * 0.42)
+
+    chest_final = round(float(np.clip(chest_adj, 28.0, 62.0)), 1)
+    waist_final = round(float(np.clip(waist_adj, 24.0, 56.0)), 1)
+
+    shoulder_waist_diff = shoulder_in - waist_final
+    if shoulder_waist_diff >= 6.5 and bmi < 27.5:
+        physique = "Athletic / V-Taper Physique 🏋️‍♂️"
+    elif bmi < 18.5:
+        physique = "Lean / Slim Build 🏃"
+    elif waist_final >= chest_final - 1.5 or bmi >= 28.0:
+        physique = "Comfort / Relaxed Fit 🧥"
+    else:
+        physique = "Standard / Balanced Fit ✨"
+
+    return chest_final, waist_final, bmi, physique
+
+
 @app.post("/api/predict-size")
 async def predict_size(
     image: UploadFile = File(...),
     side_image: Optional[UploadFile] = File(None),
     height_cm: float = Form(...),
+    weight_kg: Optional[float] = Form(None),
     gender: str = Form("male"),
 ):
     try:
@@ -237,18 +278,40 @@ async def predict_size(
         if waist_in < 26.0:
             waist_in = round(max(28.0, chest_in * 0.80), 1)
 
-        base_conf = 85.0 + (avg_vis * 8.0) + (0.5 if used_dual_photo else 0.0)
-        accuracy_percentage = round(min(max(base_conf, 85.0), 93.5), 1)
+        shoulder_in = round(outer_shoulder_cm / 2.54, 1)
 
-        # 5. STRICT PHYSIQUE LOGIC (Must have >= 8.5 inch difference to be Athletic)
-        chest_waist_diff = chest_in - waist_in
+        # Apply Weight + BMI calibration when weight_kg is provided
+        bmi_val = None
+        calibrated_physique = None
+        if weight_kg is not None and weight_kg > 0:
+            chest_in, waist_in, bmi_val, calibrated_physique = (
+                apply_weight_bmi_calibration(
+                    chest_in=chest_in,
+                    waist_in=waist_in,
+                    height_cm=height_cm,
+                    weight_kg=weight_kg,
+                    shoulder_in=shoulder_in,
+                )
+            )
+            side_note = f"{side_note} + Weight/BMI calibrated"
 
-        if chest_waist_diff >= 8.5:
-            body_type = "Athletic / V-Taper Physique 🏋️‍♂️"
-        elif waist_in >= chest_in - 1.5:
-            body_type = "Comfort / Relaxed Fit 🧥"
+        weight_bonus = 1.5 if bmi_val is not None else 0.0
+        base_conf = (
+            85.0 + (avg_vis * 8.0) + (0.5 if used_dual_photo else 0.0) + weight_bonus
+        )
+        accuracy_percentage = round(min(max(base_conf, 85.0), 94.5), 1)
+
+        # 5. PHYSIQUE CLASSIFICATION
+        if calibrated_physique is not None:
+            body_type = calibrated_physique
         else:
-            body_type = "Standard / Balanced Fit ✨"
+            chest_waist_diff = chest_in - waist_in
+            if chest_waist_diff >= 8.5:
+                body_type = "Athletic / V-Taper Physique 🏋️‍♂️"
+            elif waist_in >= chest_in - 1.5:
+                body_type = "Comfort / Relaxed Fit 🧥"
+            else:
+                body_type = "Standard / Balanced Fit ✨"
 
         # 6. DYNAMIC SHIRT SIZING
         if chest_in < 36:
@@ -274,6 +337,17 @@ async def predict_size(
         else:
             pant_size = "40+ (XXL)"
 
+        measurements_payload = {
+            "height_cm": height_cm,
+            "shoulder_inches": shoulder_in,
+            "chest_inches": chest_in,
+            "waist_inches": waist_in,
+        }
+        if weight_kg is not None and weight_kg > 0:
+            measurements_payload["weight_kg"] = round(weight_kg, 1)
+        if bmi_val is not None:
+            measurements_payload["bmi"] = bmi_val
+
         return {
             "status": "success",
             "body_type": body_type,
@@ -282,12 +356,7 @@ async def predict_size(
             "recommended_pant_size": pant_size,
             "accuracy_percentage": accuracy_percentage,
             "dual_photo_used": used_dual_photo,
-            "measurements": {
-                "height_cm": height_cm,
-                "shoulder_inches": round(outer_shoulder_cm / 2.54, 1),
-                "chest_inches": chest_in,
-                "waist_inches": waist_in,
-            },
+            "measurements": measurements_payload,
             "confidence": f"High ({side_note})",
         }
 
