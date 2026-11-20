@@ -189,8 +189,9 @@ def segment_body_grabcut(
             2,
             cv2.GC_INIT_WITH_RECT
         )
+        # Only definite foreground to avoid background/arm bleed
         person_mask = np.where(
-            (mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD),
+            mask == cv2.GC_FGD,
             255,
             0
         ).astype(np.uint8)
@@ -208,34 +209,57 @@ def measure_horizontal_width_px(
     y_pos: int,
     fallback_px: float,
     x_center_hint: int,
-    max_half_span: int
+    max_half_span: int,
+    min_px: float,
+    max_px: float
 ) -> float:
 
     if person_mask is None:
-        return fallback_px
+        return float(np.clip(fallback_px, min_px, max_px))
 
     h, w = person_mask.shape
-    y0 = max(0, y_pos - 4)
-    y1 = min(h, y_pos + 5)
+    y0 = max(0, y_pos - 3)
+    y1 = min(h, y_pos + 4)
     if y0 >= y1:
-        return fallback_px
+        return float(np.clip(fallback_px, min_px, max_px))
 
     band = person_mask[y0:y1, :]
-    active = np.any(band > 0, axis=0)
+    active = np.any(band > 0, axis=0).astype(np.uint8)
 
     x_min_lim = max(0, x_center_hint - max_half_span)
     x_max_lim = min(w, x_center_hint + max_half_span + 1)
+    if x_min_lim >= x_max_lim:
+        return float(np.clip(fallback_px, min_px, max_px))
 
-    xs = np.where(active[x_min_lim:x_max_lim])[0]
-    if len(xs) < 2:
-        return fallback_px
+    sub = active[x_min_lim:x_max_lim]
+    padded = np.concatenate(([0], sub, [0]))
+    diffs = np.diff(padded)
+    starts = np.where(diffs == 1)[0]
+    ends = np.where(diffs == -1)[0]
 
-    measured = float(xs[-1] - xs[0] + 1)
-    # Guard against noisy mask jumps
-    if measured < fallback_px * 0.6 or measured > fallback_px * 1.65:
-        return fallback_px
+    if len(starts) == 0:
+        return float(np.clip(fallback_px, min_px, max_px))
 
-    return measured
+    # Pick contiguous foreground segment closest to torso center
+    rel_center = float(x_center_hint - x_min_lim)
+    best_span = None
+    best_dist = float("inf")
+    for s, e in zip(starts, ends):
+        span = float(e - s)
+        if span < 3:
+            continue
+        seg_center = 0.5 * (s + e)
+        dist = abs(seg_center - rel_center)
+        if dist < best_dist:
+            best_dist = dist
+            best_span = span
+
+    if best_span is None:
+        return float(np.clip(fallback_px, min_px, max_px))
+
+    # Blend 60% measured central span + 40% pose-derived fallback for stability
+    blended = 0.60 * best_span + 0.40 * fallback_px
+    return float(np.clip(blended, min_px, max_px))
 
 
 def extract_pose_metrics(
@@ -302,7 +326,8 @@ def extract_pose_metrics(
 
     torso_pixels = max(hip_y - shoulder_y, 1)
 
-    body_width = max(shoulder_width_px, hip_width_px) * 1.8
+    # Tighter bounding box around body to reduce background inclusion
+    body_width = max(shoulder_width_px, hip_width_px) * 1.45
     center_x = int(
         (left_shoulder.x + right_shoulder.x + left_hip.x + right_hip.x) / 4.0 * w
     )
@@ -317,13 +342,16 @@ def extract_pose_metrics(
 
     person_mask = segment_body_grabcut(img, x1, top_y, x2, bottom_y)
 
-    # Segmentation-based vertical body height if mask spans full body cleanly, else fallback
+    # Segmentation-based vertical body height if mask spans cleanly, else fallback
     if person_mask is not None:
         ys, _ = np.where(person_mask > 0)
-        if len(ys) > 50 and (int(ys.max()) - int(ys.min())) > 50:
-            pixel_height = float(int(ys.max()) - int(ys.min()))
+        seg_h = float(int(ys.max()) - int(ys.min())) if len(ys) > 50 else 0.0
+        pose_est_h = max((ankle_y - nose_y) / 0.84, 1.0)
+        # Ensure mask height is plausible relative to pose span
+        if seg_h > pose_est_h * 0.65 and seg_h < pose_est_h * 1.35:
+            pixel_height = seg_h
         else:
-            pixel_height = max((ankle_y - nose_y) / 0.84, 1.0)
+            pixel_height = pose_est_h
     else:
         pixel_height = max((ankle_y - nose_y) / 0.84, 1.0)
 
@@ -332,28 +360,40 @@ def extract_pose_metrics(
     chest_y = int(np.clip(shoulder_y + torso_pixels * 0.28, 0, h - 1))
     waist_y = int(np.clip(shoulder_y + torso_pixels * 0.65, 0, h - 1))
 
-    max_half_span = max(int(max(shoulder_width_px, hip_width_px) * 0.85), 20)
+    # Keep horizontal search tight to torso so arms don't inflate width/depth
+    sh_half_span = max(int(shoulder_width_px * 0.65), 15)
+    hip_half_span = max(int(hip_width_px * 0.72), 15)
+
+    shoulder_fallback = shoulder_width_px * 1.15
+    chest_fallback = shoulder_width_px * 0.96
+    waist_fallback = hip_width_px * 1.05
 
     shoulder_px = measure_horizontal_width_px(
         person_mask,
         shoulder_y,
-        shoulder_width_px * 1.20,
+        shoulder_fallback,
         center_x,
-        max_half_span
+        sh_half_span,
+        min_px=shoulder_width_px * 0.90,
+        max_px=shoulder_width_px * 1.30,
     )
     chest_px = measure_horizontal_width_px(
         person_mask,
         chest_y,
-        shoulder_width_px * 1.12,
+        chest_fallback,
         center_x,
-        max_half_span
+        sh_half_span,
+        min_px=shoulder_width_px * 0.78,
+        max_px=shoulder_width_px * 1.12,
     )
     waist_px = measure_horizontal_width_px(
         person_mask,
         waist_y,
-        hip_width_px * 1.15,
+        waist_fallback,
         center_x,
-        max_half_span
+        hip_half_span,
+        min_px=hip_width_px * 0.80,
+        max_px=hip_width_px * 1.25,
     )
 
     torso_len_cm = max(torso_pixels * cm_per_pixel, 1.0)
@@ -409,18 +449,19 @@ async def predict_size(
                     side_waist_cm = side_data["waist_px"] * side_data["cm_per_pixel"]
                     ref_torso_cm = 0.5 * (torso_len_cm + side_data["torso_len_cm"])
 
+                    # Blend side mask width with width-proportional depth to avoid arm inflation
                     chest_depth_cm = float(
                         np.clip(
-                            0.65 * side_chest_cm + 0.35 * (ref_torso_cm * 0.50),
-                            16.0,
-                            36.0
+                            0.50 * side_chest_cm + 0.50 * (chest_width_cm * 0.64),
+                            15.0,
+                            32.0
                         )
                     )
                     waist_depth_cm = float(
                         np.clip(
-                            0.65 * side_waist_cm + 0.35 * (ref_torso_cm * 0.46),
-                            15.0,
-                            36.0
+                            0.50 * side_waist_cm + 0.50 * (waist_width_cm * 0.65),
+                            14.0,
+                            32.0
                         )
                     )
 
@@ -438,14 +479,14 @@ async def predict_size(
                     used_dual_photo = True
                     side_note = "Dual-photo (Front + Side) GrabCut + Ellipse estimation"
                 else:
-                    chest_in = round((chest_width_cm * 2.45) / 2.54, 1)
-                    waist_in = round((waist_width_cm * 2.40) / 2.54, 1)
+                    chest_in = round((chest_width_cm * 2.35) / 2.54, 1)
+                    waist_in = round((waist_width_cm * 2.30) / 2.54, 1)
             else:
-                chest_in = round((chest_width_cm * 2.45) / 2.54, 1)
-                waist_in = round((waist_width_cm * 2.40) / 2.54, 1)
+                chest_in = round((chest_width_cm * 2.35) / 2.54, 1)
+                waist_in = round((waist_width_cm * 2.30) / 2.54, 1)
         else:
-            chest_in = round((chest_width_cm * 2.45) / 2.54, 1)
-            waist_in = round((waist_width_cm * 2.40) / 2.54, 1)
+            chest_in = round((chest_width_cm * 2.35) / 2.54, 1)
+            waist_in = round((waist_width_cm * 2.30) / 2.54, 1)
 
         if waist_in < 26.0:
             waist_in = round(max(28.0, chest_in * 0.80), 1)
