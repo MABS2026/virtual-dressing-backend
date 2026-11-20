@@ -520,16 +520,20 @@ async def predict_size(
         else:
             recommended_size = "XXL (Double Extra Large)"
 
-        if waist_in <= 31:
-            pant_size = "30-32 (Small)"
-        elif waist_in <= 34:
-            pant_size = "32-34 (Medium)"
-        elif waist_in <= 37:
-            pant_size = "34-36 (Large)"
-        elif waist_in <= 41:
-            pant_size = "38 (XL)"
+        if waist_in < 28.0:
+            pant_size = 'XS (Under 28" Waist)'
+        elif waist_in < 30.0:
+            pant_size = 'S (28-29" Waist)'
+        elif waist_in < 33.0:
+            pant_size = 'M (30-32" Waist)'
+        elif waist_in < 36.0:
+            pant_size = 'L (33-35" Waist)'
+        elif waist_in < 39.0:
+            pant_size = 'XL (36-38" Waist)'
+        elif waist_in <= 42.5:
+            pant_size = 'XXL (39-42" Waist)'
         else:
-            pant_size = "40+ (XXL)"
+            pant_size = '3XL (42"+ Waist)'
 
         measurements_payload = {
             "height_cm": height_cm,
