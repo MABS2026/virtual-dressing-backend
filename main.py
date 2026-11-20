@@ -365,7 +365,7 @@ def extract_pose_metrics(
     hip_half_span = max(int(hip_width_px * 0.72), 15)
 
     shoulder_fallback = shoulder_width_px * 1.15
-    chest_fallback = shoulder_width_px * 0.96
+    chest_fallback = shoulder_width_px * 1.06
     waist_fallback = hip_width_px * 1.05
 
     shoulder_px = measure_horizontal_width_px(
@@ -383,8 +383,8 @@ def extract_pose_metrics(
         chest_fallback,
         center_x,
         sh_half_span,
-        min_px=shoulder_width_px * 0.78,
-        max_px=shoulder_width_px * 1.12,
+        min_px=shoulder_width_px * 0.90,
+        max_px=shoulder_width_px * 1.22,
     )
     waist_px = measure_horizontal_width_px(
         person_mask,
