@@ -167,29 +167,31 @@ def extract_pose_metrics(image_bytes: bytes, height_cm: float):
     }, None
 
 
+def compute_bmi(height_cm: float, weight_kg: Optional[float]) -> Optional[float]:
+    if weight_kg is None or weight_kg <= 0 or height_cm <= 0:
+        return None
+    height_m = height_cm / 100.0
+    return round(weight_kg / (height_m * height_m), 1)
+
+
 def apply_weight_bmi_calibration(
     chest_in: float,
     waist_in: float,
-    height_cm: float,
-    weight_kg: Optional[float],
+    bmi: Optional[float],
     shoulder_in: float,
 ):
     """
-    Calibrates chest & waist circumference estimates using weight_kg and BMI
-    when a valid weight is provided.
+    General BMI-based calibration across any height and weight.
+    Uses BMI ~22.0 as neutral reference and adjusts chest & waist proportionally.
     """
-    if weight_kg is None or weight_kg <= 0 or height_cm <= 0:
-        return chest_in, waist_in, None, None
+    if bmi is None:
+        return chest_in, waist_in, None
 
-    height_m = height_cm / 100.0
-    bmi = round(weight_kg / (height_m * height_m), 1)
-
-    # Baseline BMI ~22.0: gently adjust chest & waist based on weight/BMI delta
     bmi_delta = bmi - 22.0
 
-    # Blend 75% vision-derived estimate + 25% weight-calibrated adjustment
-    chest_adj = chest_in + (bmi_delta * 0.30)
-    waist_adj = waist_in + (bmi_delta * 0.42)
+    # General continuous adjustment (no single height/weight hardcoded)
+    chest_adj = chest_in + (bmi_delta * 0.45)
+    waist_adj = waist_in + (bmi_delta * 0.40)
 
     chest_final = round(float(np.clip(chest_adj, 28.0, 62.0)), 1)
     waist_final = round(float(np.clip(waist_adj, 24.0, 56.0)), 1)
@@ -204,7 +206,7 @@ def apply_weight_bmi_calibration(
     else:
         physique = "Standard / Balanced Fit ✨"
 
-    return chest_final, waist_final, bmi, physique
+    return chest_final, waist_final, physique
 
 
 @app.post("/api/predict-size")
@@ -227,16 +229,22 @@ async def predict_size(
         torso_len_cm = front_data["torso_len_cm"]
         avg_vis = front_data["avg_vis"]
 
+        bmi_val = compute_bmi(height_cm, weight_kg)
+        # Depth ratio scales smoothly with BMI around 0.62 (neutral BMI 22.0)
+        depth_ratio = float(
+            np.clip(0.62 + ((bmi_val - 22.0) * 0.012 if bmi_val is not None else 0.0), 0.54, 0.78)
+        )
+
         # Convert inner MediaPipe landmarks to approximate outer body widths (cm)
         outer_shoulder_cm = max(
-            front_data["landmark_shoulder_px"] * cm_per_pixel * 1.22, 25.0
+            front_data["landmark_shoulder_px"] * cm_per_pixel * 1.18, 25.0
         )
-        chest_width_cm = max(outer_shoulder_cm * 0.94, 22.0)
+        chest_width_cm = max(outer_shoulder_cm * 0.90, 22.0)
 
         outer_hip_cm = max(
-            front_data["landmark_hip_px"] * cm_per_pixel * 1.25, 22.0
+            front_data["landmark_hip_px"] * cm_per_pixel * 1.22, 22.0
         )
-        waist_width_cm = max(outer_hip_cm * 0.92, 20.0)
+        waist_width_cm = max(outer_hip_cm * 0.90, 20.0)
 
         used_dual_photo = False
         side_note = "Single-photo proportional estimation"
@@ -249,8 +257,17 @@ async def predict_size(
                     side_torso_cm = side_data["torso_len_cm"]
                     ref_torso_cm = 0.5 * (torso_len_cm + side_torso_cm)
 
-                    chest_depth_cm = float(np.clip(ref_torso_cm * 0.58, 20.0, 36.0))
-                    waist_depth_cm = float(np.clip(ref_torso_cm * 0.52, 18.0, 36.0))
+                    # Tie chest depth to chest_width_cm & depth_ratio so tall frames don't inflate depth
+                    chest_depth_cm = float(
+                        np.clip(chest_width_cm * depth_ratio, 16.0, 34.0)
+                    )
+                    waist_depth_cm = float(
+                        np.clip(
+                            max(waist_width_cm * (depth_ratio * 0.95), ref_torso_cm * 0.44),
+                            15.0,
+                            34.0,
+                        )
+                    )
 
                     chest_circ_cm = ellipse_circumference_cm(
                         chest_width_cm, chest_depth_cm
@@ -266,32 +283,28 @@ async def predict_size(
                     used_dual_photo = True
                     side_note = "Dual-photo (Front + Side) Ellipse estimation"
                 else:
-                    chest_in = round((chest_width_cm * 2.55) / 2.54, 1)
-                    waist_in = round((waist_width_cm * 2.45) / 2.54, 1)
+                    chest_in = round((chest_width_cm * 2.45) / 2.54, 1)
+                    waist_in = round((waist_width_cm * 2.40) / 2.54, 1)
             else:
-                chest_in = round((chest_width_cm * 2.55) / 2.54, 1)
-                waist_in = round((waist_width_cm * 2.45) / 2.54, 1)
+                chest_in = round((chest_width_cm * 2.45) / 2.54, 1)
+                waist_in = round((waist_width_cm * 2.40) / 2.54, 1)
         else:
-            chest_in = round((chest_width_cm * 2.55) / 2.54, 1)
-            waist_in = round((waist_width_cm * 2.45) / 2.54, 1)
+            chest_in = round((chest_width_cm * 2.45) / 2.54, 1)
+            waist_in = round((waist_width_cm * 2.40) / 2.54, 1)
 
         if waist_in < 26.0:
             waist_in = round(max(28.0, chest_in * 0.80), 1)
 
         shoulder_in = round(outer_shoulder_cm / 2.54, 1)
 
-        # Apply Weight + BMI calibration when weight_kg is provided
-        bmi_val = None
+        # Apply general Weight + BMI calibration when BMI is available
         calibrated_physique = None
-        if weight_kg is not None and weight_kg > 0:
-            chest_in, waist_in, bmi_val, calibrated_physique = (
-                apply_weight_bmi_calibration(
-                    chest_in=chest_in,
-                    waist_in=waist_in,
-                    height_cm=height_cm,
-                    weight_kg=weight_kg,
-                    shoulder_in=shoulder_in,
-                )
+        if bmi_val is not None:
+            chest_in, waist_in, calibrated_physique = apply_weight_bmi_calibration(
+                chest_in=chest_in,
+                waist_in=waist_in,
+                bmi=bmi_val,
+                shoulder_in=shoulder_in,
             )
             side_note = f"{side_note} + Weight/BMI calibrated"
 
