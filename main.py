@@ -387,8 +387,8 @@ def extract_pose_metrics(
     for pt in key_points:
         if pt.visibility < 0.35:
             return None, 0.0, (
-                "Kuch body parts clearly nazar nahi aa rahe. "
-                "Poori body (sar se paon tak) frame mein rakhein."
+              "Some body parts aren't clearly visible. "
+                "Please keep your full body (head to toe) inside the frame."
             )
 
     avg_vis = sum(pt.visibility for pt in key_points) / len(key_points)
