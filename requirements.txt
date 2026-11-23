@@ -1,7 +1,6 @@
 fastapi
 uvicorn
 python-multipart
-gradio_client
 opencv-python-headless
 numpy
 pillow
