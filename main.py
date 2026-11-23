@@ -394,4 +394,188 @@ def extract_pose_metrics(
     hip_y = ((left_hip.y + right_hip.y) / 2.0) * h
     ankle_y = ((left_ankle.y + right_ankle.y) / 2.0) * h
 
-    # Full height calibration from
+    # Full height calibration from crown (~nose - 0.09*h) to sole (~ankle + 0.03*h)
+    top_head_y = max(0.0, nose_y - 0.09 * h)
+    bottom_foot_y = min(float(h), ankle_y + 0.03 * h)
+    body_height_px = max(10.0, bottom_foot_y - top_head_y)
+
+    cm_per_px = height_cm / body_height_px
+
+    shoulder_width_px = abs(left_shoulder.x - right_shoulder.x) * w
+    hip_width_px = abs(left_hip.x - right_hip.x) * w
+
+    x1 = max(
+        0,
+        int(min(left_shoulder.x, right_shoulder.x, left_hip.x, right_hip.x) * w - 0.14 * w),
+    )
+    x2 = min(
+        w,
+        int(max(left_shoulder.x, right_shoulder.x, left_hip.x, right_hip.x) * w + 0.14 * w),
+    )
+    seg_top_y = max(0, int(top_head_y))
+    seg_bot_y = min(h, int(bottom_foot_y))
+
+    person_mask = segment_body_grabcut(img, x1, seg_top_y, x2, seg_bot_y)
+    x_center_hint = int(((left_hip.x + right_hip.x) / 2.0) * w)
+    max_half_span = max(25, int(0.35 * w))
+
+    waist_y = int(0.56 * shoulder_y + 0.44 * hip_y)
+    fallback_waist_px = (
+        0.86 * hip_width_px if hip_width_px > 0 else 0.80 * shoulder_width_px
+    )
+
+    # Outer garment & body calibration factors for realistic 2D-to-3D torso projection
+    shoulder_cal = 1.22
+    waist_cal = 1.38
+    hip_cal = 1.25
+
+    measured_shoulder_px = measure_horizontal_width_px(
+        person_mask=person_mask,
+        y_pos=int(shoulder_y),
+        fallback_px=shoulder_width_px if shoulder_width_px > 0 else 80.0,
+        x_center_hint=x_center_hint,
+        max_half_span=max_half_span,
+        min_px=20.0,
+        max_px=float(w),
+    ) * shoulder_cal
+
+    measured_waist_px = measure_horizontal_width_px(
+        person_mask=person_mask,
+        y_pos=waist_y,
+        fallback_px=fallback_waist_px if fallback_waist_px > 0 else 70.0,
+        x_center_hint=x_center_hint,
+        max_half_span=max_half_span,
+        min_px=18.0,
+        max_px=float(w),
+    ) * waist_cal
+
+    measured_hip_px = measure_horizontal_width_px(
+        person_mask=person_mask,
+        y_pos=int(hip_y),
+        fallback_px=hip_width_px if hip_width_px > 0 else 75.0,
+        x_center_hint=x_center_hint,
+        max_half_span=max_half_span,
+        min_px=20.0,
+        max_px=float(w),
+    ) * hip_cal
+
+    shoulder_cm = measured_shoulder_px * cm_per_px
+    waist_width_cm = measured_waist_px * cm_per_px
+    hip_width_cm = measured_hip_px * cm_per_px
+
+    height_m = max(height_cm / 100.0, 1.2)
+    bmi = weight_kg / (height_m * height_m)
+    depth_scale = float(np.clip(0.68 + (bmi - 21.0) * 0.015, 0.62, 0.92))
+
+    waist_depth_cm = waist_width_cm * depth_scale
+    hip_depth_cm = hip_width_cm * depth_scale
+    chest_width_cm = shoulder_cm * 0.95
+    chest_depth_cm = chest_width_cm * depth_scale
+
+    chest_cm = ellipse_circumference_cm(chest_width_cm, chest_depth_cm)
+    waist_cm = ellipse_circumference_cm(waist_width_cm, waist_depth_cm)
+    hip_cm = ellipse_circumference_cm(hip_width_cm, hip_depth_cm)
+
+    print(
+        "DEBUG METRICS:",
+        "conf=", confidence_pct,
+        "body_h_px=", round(body_height_px, 1),
+        "cm_per_px=", round(cm_per_px, 4),
+        "meas_sh_px=", round(measured_shoulder_px, 1),
+        "meas_w_px=", round(measured_waist_px, 1),
+        "chest_in=", round(chest_cm / 2.54, 1),
+        "waist_in=", round(waist_cm / 2.54, 1),
+    )
+
+    return {
+        "shoulder_cm": round(shoulder_cm, 1),
+        "chest_cm": round(chest_cm, 1),
+        "waist_cm": round(waist_cm, 1),
+        "hip_cm": round(hip_cm, 1),
+        "chest_inches": round(chest_cm / 2.54, 1),
+        "waist_inches": round(waist_cm / 2.54, 1),
+        "hip_inches": round(hip_cm / 2.54, 1),
+        "shoulder_inches": round(shoulder_cm / 2.54, 1),
+    }, confidence_pct, None
+
+
+def _pant_size_from_waist_inches(waist_in: float) -> str:
+    if waist_in < 28.0:
+        return "XS"
+    elif waist_in <= 29.0:
+        return "Small"
+    elif waist_in <= 32.0:
+        return "M"
+    elif waist_in <= 35.0:
+        return "Large"
+    elif waist_in <= 38.0:
+        return "L"
+    else:
+        return "XL"
+
+
+def _shirt_size_from_chest_inches(chest_in: float) -> str:
+    if chest_in < 36.0:
+        return "XS"
+    elif chest_in < 38.0:
+        return "S"
+    elif chest_in < 41.0:
+        return "M"
+    elif chest_in < 44.0:
+        return "L"
+    else:
+        return "XL"
+
+
+@app.post("/api/predict-size")
+async def predict_size(
+    image: UploadFile = File(...),
+    side_image: Optional[UploadFile] = File(None),
+    height_cm: float = Form(...),
+    weight_kg: float = Form(...),
+):
+    try:
+        front_bytes = await image.read()
+        if not front_bytes:
+            raise HTTPException(status_code=400, detail="Front photo required hai.")
+
+        if side_image is not None:
+            _ = await side_image.read()
+
+        metrics, confidence_pct, err = extract_pose_metrics(
+            front_bytes,
+            height_cm,
+            weight_kg,
+        )
+        if err or metrics is None:
+            raise HTTPException(status_code=400, detail=err or "Pose detection failed.")
+
+        chest_in = metrics["chest_inches"]
+        waist_in = metrics["waist_inches"]
+
+        shirt_size = _shirt_size_from_chest_inches(chest_in)
+        pant_size = _pant_size_from_waist_inches(waist_in)
+
+        return JSONResponse(
+            content={
+                "status": "success",
+                "height_cm": round(height_cm, 1),
+                "weight_kg": round(weight_kg, 1),
+                "confidence": confidence_pct,
+                "confidence_percentage": confidence_pct,
+                "measurements": metrics,
+                "recommended_shirt_size": shirt_size,
+                "recommended_pant_size": pant_size,
+                "recommended_size": shirt_size,
+            }
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
