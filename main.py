@@ -462,6 +462,17 @@ def extract_pose_metrics(
     waist_cm = ellipse_circumference_cm(waist_width_cm, waist_depth_cm)
     hip_cm = ellipse_circumference_cm(hip_width_cm, hip_depth_cm)
 
+    print(
+        "DEBUG METRICS:",
+        "body_h_px=", round(body_height_px, 1),
+        "cm_per_px=", round(cm_per_px, 4),
+        "sh_px=", round(shoulder_width_px, 1),
+        "meas_sh_px=", round(measured_shoulder_px, 1),
+        "meas_w_px=", round(measured_waist_px, 1),
+        "chest_in=", round(chest_cm / 2.54, 1),
+        "waist_in=", round(waist_cm / 2.54, 1),
+    )
+
     return {
         "shoulder_cm": round(shoulder_cm, 1),
         "chest_cm": round(chest_cm, 1),
