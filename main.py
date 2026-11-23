@@ -25,7 +25,10 @@ app = FastAPI()
 # FASHN AI TRY-ON MAX CONFIG
 # ==========================================
 
-FASHN_API_KEY = os.environ.get("FASHN_API_KEY", "fa-LKYXdavvGOc4-RaLBOccIDvo6lcb43OCd3nHj").strip()
+FASHN_API_KEY = os.environ.get(
+    "FASHN_API_KEY",
+    "fa-LKYXdavvGOc4-RaLBOccIDvo6lcb43OCd3nHj",
+).strip()
 FASHN_RUN_URL = "https://api.fashn.ai/v1/run"
 FASHN_STATUS_BASE = "https://api.fashn.ai/v1/status"
 MAX_IMAGE_BYTES = 30 * 1024 * 1024  # 30 MiB limit per FASHN docs
@@ -81,7 +84,6 @@ def _run_fashn_tryon(
     if not prediction_id:
         raise RuntimeError(f"Prediction ID nahi mila: {run_data}")
 
-    # Poll status endpoint until completed
     max_attempts = 50
     poll_interval = 3.0
 
@@ -134,7 +136,6 @@ def ellipse_circumference_cm(
     width_cm: float,
     depth_cm: float
 ) -> float:
-
     a = max(width_cm / 2.0, 0.1)
     b = max(depth_cm / 2.0, 0.1)
 
@@ -155,7 +156,6 @@ def ellipse_circumference_cm(
 
 @app.get("/")
 async def root():
-
     return {
         "status": "online",
         "message": "Virtual Dressing Backend is running successfully!"
@@ -175,7 +175,6 @@ async def try_on(
     generation_mode: str = Form("fast"),
     output_format: str = Form("jpeg"),
 ):
-
     try:
         user_bytes = await user.read()
         garment_bytes = await garment.read()
@@ -248,7 +247,6 @@ def segment_body_grabcut(
     x2: int,
     bottom_y: int
 ) -> Optional[np.ndarray]:
-
     h, w, _ = img.shape
     rect_w = x2 - x1
     rect_h = bottom_y - top_y
@@ -294,7 +292,6 @@ def measure_horizontal_width_px(
     min_px: float,
     max_px: float
 ) -> float:
-
     if person_mask is None:
         return float(np.clip(fallback_px, min_px, max_px))
 
@@ -312,72 +309,4 @@ def measure_horizontal_width_px(
     if x_min_lim >= x_max_lim:
         return float(np.clip(fallback_px, min_px, max_px))
 
-    sub = active[x_min_lim:x_max_lim]
-    padded = np.concatenate(([0], sub, [0]))
-    diffs = np.diff(padded)
-    starts = np.where(diffs == 1)[0]
-    ends = np.where(diffs == -1)[0]
-
-    if len(starts) == 0:
-        return float(np.clip(fallback_px, min_px, max_px))
-
-    rel_center = float(x_center_hint - x_min_lim)
-    best_span = None
-    best_dist = float("inf")
-    for s, e in zip(starts, ends):
-        span = float(e - s)
-        if span < 3:
-            continue
-        seg_center = 0.5 * (s + e)
-        dist = abs(seg_center - rel_center)
-        if dist < best_dist:
-            best_dist = dist
-            best_span = span
-
-    if best_span is None:
-        return float(np.clip(fallback_px, min_px, max_px))
-
-    blended = 0.60 * best_span + 0.40 * fallback_px
-    return float(np.clip(blended, min_px, max_px))
-
-
-def extract_pose_metrics(
-    image_bytes: bytes,
-    height_cm: float
-):
-
-    nparr = np.frombuffer(image_bytes, np.uint8)
-    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-
-    if img is None:
-        return None, "Invalid image file"
-
-    h, w, _ = img.shape
-    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    results = pose.process(img_rgb)
-
-    if not results.pose_landmarks:
-        return None, (
-            "Body clearly detect nahi hui. "
-            "Full body photo seedhay kharay ho kar upload karein."
-        )
-
-    landmarks = results.pose_landmarks.landmark
-
-    nose = landmarks[mp_pose.PoseLandmark.NOSE]
-    left_shoulder = landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER]
-    right_shoulder = landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER]
-    left_hip = landmarks[mp_pose.PoseLandmark.LEFT_HIP]
-    right_hip = landmarks[mp_pose.PoseLandmark.RIGHT_HIP]
-    left_ankle = landmarks[mp_pose.PoseLandmark.LEFT_ANKLE]
-    right_ankle = landmarks[mp_pose.PoseLandmark.RIGHT_ANKLE]
-
-    key_points = [
-        nose,
-        left_shoulder,
-        right_shoulder,
-        left_hip,
-        right_hip,
-        left_ankle,
-        right_ankle,
-    ]
+    sub = active
