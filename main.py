@@ -25,7 +25,7 @@ app = FastAPI()
 # FASHN AI TRY-ON MAX CONFIG
 # ==========================================
 
-FASHN_API_KEY = os.environ.get("FASHN_API_KEY", "").strip()
+FASHN_API_KEY = os.environ.get("FASHN_API_KEY", "fa-LKYXdavvGOc4-RaLBOccIDvo6lcb43OCd3nHj").strip()
 FASHN_RUN_URL = "https://api.fashn.ai/v1/run"
 FASHN_STATUS_BASE = "https://api.fashn.ai/v1/status"
 MAX_IMAGE_BYTES = 30 * 1024 * 1024  # 30 MiB limit per FASHN docs
