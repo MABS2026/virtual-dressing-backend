@@ -270,7 +270,7 @@ def segment_body_grabcut(
             cv2.GC_INIT_WITH_RECT
         )
         person_mask = np.where(
-            mask == cv2.GC_FGD,
+            (mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD),
             255,
             0
         ).astype(np.uint8)
@@ -335,7 +335,6 @@ def measure_horizontal_width_px(
     if best_span is None:
         return safe_fallback
 
-    # Reject background/door segments much wider than expected torso/limb span
     if best_span > safe_fallback * 1.45:
         best_span = safe_fallback
 
@@ -428,10 +427,9 @@ def extract_pose_metrics(
         0.84 * hip_width_px if hip_width_px > 0 else 0.78 * shoulder_width_px
     )
 
-    # Practical anthropometric calibration for front-view pose landmarks
-    shoulder_cal = 1.18
-    waist_cal = 1.24
-    hip_cal = 1.16
+    shoulder_cal = 1.15
+    waist_cal = 1.48
+    hip_cal = 1.18
 
     measured_shoulder_px = measure_horizontal_width_px(
         person_mask=person_mask,
@@ -471,22 +469,23 @@ def extract_pose_metrics(
 
     waist_depth_cm = raw_waist_width_cm * depth_scale
     hip_depth_cm = raw_hip_width_cm * depth_scale
-    chest_width_cm = raw_shoulder_cm * 0.94
+    chest_width_cm = raw_shoulder_cm * 0.92
     chest_depth_cm = chest_width_cm * depth_scale
 
     raw_chest_cm = ellipse_circumference_cm(chest_width_cm, chest_depth_cm)
     raw_waist_cm = ellipse_circumference_cm(raw_waist_width_cm, waist_depth_cm)
     raw_hip_cm = ellipse_circumference_cm(raw_hip_width_cm, hip_depth_cm)
 
-    # Anthropometric prior anchor (height + weight/BMI) blended with pose measurements
-    prior_chest_cm = 0.42 * height_cm + 0.34 * weight_kg - 0.5
-    prior_waist_cm = 0.24 * height_cm + 0.44 * weight_kg - 0.8
-    prior_hip_cm = 0.32 * height_cm + 0.42 * weight_kg + 1.5
+    # BMI-aware anthropometric prior for realistic adult proportions
+    bmi_adj = float(np.clip((bmi - 20.0) * 1.4, -5.0, 12.0))
+    prior_chest_cm = 0.36 * height_cm + 0.38 * weight_kg + 5.5 + bmi_adj
+    prior_waist_cm = 0.26 * height_cm + 0.46 * weight_kg + 1.5 + (bmi_adj * 1.1)
+    prior_hip_cm = 0.30 * height_cm + 0.44 * weight_kg + 6.0 + bmi_adj
 
-    chest_cm = float(np.clip(0.55 * raw_chest_cm + 0.45 * prior_chest_cm, 78.0, 135.0))
-    waist_cm = float(np.clip(0.55 * raw_waist_cm + 0.45 * prior_waist_cm, 62.0, 125.0))
-    hip_cm = float(np.clip(0.55 * raw_hip_cm + 0.45 * prior_hip_cm, 78.0, 135.0))
-    shoulder_cm = float(np.clip(0.55 * raw_shoulder_cm + 0.45 * (chest_cm * 0.44), 34.0, 62.0))
+    chest_cm = float(np.clip(0.40 * raw_chest_cm + 0.60 * prior_chest_cm, 82.0, 132.0))
+    waist_cm = float(np.clip(0.35 * raw_waist_cm + 0.65 * prior_waist_cm, 70.0, 122.0))
+    hip_cm = float(np.clip(0.40 * raw_hip_cm + 0.60 * prior_hip_cm, 84.0, 132.0))
+    shoulder_cm = float(np.clip(0.45 * raw_shoulder_cm + 0.55 * (chest_cm * 0.44), 36.0, 60.0))
 
     print(
         "DEBUG METRICS:",
