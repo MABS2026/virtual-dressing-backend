@@ -270,7 +270,7 @@ def segment_body_grabcut(
             cv2.GC_INIT_WITH_RECT
         )
         person_mask = np.where(
-            (mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD),
+            mask == cv2.GC_FGD,
             255,
             0
         ).astype(np.uint8)
@@ -292,14 +292,15 @@ def measure_horizontal_width_px(
     min_px: float,
     max_px: float
 ) -> float:
+    safe_fallback = float(np.clip(fallback_px, min_px, max_px))
     if person_mask is None:
-        return float(np.clip(fallback_px, min_px, max_px))
+        return safe_fallback
 
     h, w = person_mask.shape
-    y0 = max(0, y_pos - 4)
-    y1 = min(h, y_pos + 5)
+    y0 = max(0, y_pos - 3)
+    y1 = min(h, y_pos + 4)
     if y0 >= y1:
-        return float(np.clip(fallback_px, min_px, max_px))
+        return safe_fallback
 
     band = person_mask[y0:y1, :]
     active = np.any(band > 0, axis=0).astype(np.uint8)
@@ -307,7 +308,7 @@ def measure_horizontal_width_px(
     x_min_lim = max(0, x_center_hint - max_half_span)
     x_max_lim = min(w, x_center_hint + max_half_span + 1)
     if x_min_lim >= x_max_lim:
-        return float(np.clip(fallback_px, min_px, max_px))
+        return safe_fallback
 
     sub = active[x_min_lim:x_max_lim]
     padded = np.concatenate(([0], sub, [0]))
@@ -316,7 +317,7 @@ def measure_horizontal_width_px(
     ends = np.where(diffs == -1)[0]
 
     if len(starts) == 0:
-        return float(np.clip(fallback_px, min_px, max_px))
+        return safe_fallback
 
     rel_center = float(x_center_hint - x_min_lim)
     best_span = None
@@ -332,9 +333,13 @@ def measure_horizontal_width_px(
             best_span = span
 
     if best_span is None:
-        return float(np.clip(fallback_px, min_px, max_px))
+        return safe_fallback
 
-    blended = 0.70 * best_span + 0.30 * fallback_px
+    # Reject background/door segments much wider than expected torso/limb span
+    if best_span > safe_fallback * 1.45:
+        best_span = safe_fallback
+
+    blended = 0.45 * best_span + 0.55 * safe_fallback
     return float(np.clip(blended, min_px, max_px))
 
 
@@ -387,15 +392,14 @@ def extract_pose_metrics(
             )
 
     avg_vis = sum(pt.visibility for pt in key_points) / len(key_points)
-    confidence_pct = round(float(np.clip(avg_vis * 100.0, 10.0, 99.5)), 1)
+    confidence_pct = round(float(np.clip(avg_vis * 100.0, 15.0, 99.0)), 1)
 
     nose_y = nose.y * h
     shoulder_y = ((left_shoulder.y + right_shoulder.y) / 2.0) * h
     hip_y = ((left_hip.y + right_hip.y) / 2.0) * h
     ankle_y = ((left_ankle.y + right_ankle.y) / 2.0) * h
 
-    # Full height calibration from crown (~nose - 0.09*h) to sole (~ankle + 0.03*h)
-    top_head_y = max(0.0, nose_y - 0.09 * h)
+    top_head_y = max(0.0, nose_y - 0.11 * h)
     bottom_foot_y = min(float(h), ankle_y + 0.03 * h)
     body_height_px = max(10.0, bottom_foot_y - top_head_y)
 
@@ -406,85 +410,92 @@ def extract_pose_metrics(
 
     x1 = max(
         0,
-        int(min(left_shoulder.x, right_shoulder.x, left_hip.x, right_hip.x) * w - 0.14 * w),
+        int(min(left_shoulder.x, right_shoulder.x, left_hip.x, right_hip.x) * w - 0.10 * w),
     )
     x2 = min(
         w,
-        int(max(left_shoulder.x, right_shoulder.x, left_hip.x, right_hip.x) * w + 0.14 * w),
+        int(max(left_shoulder.x, right_shoulder.x, left_hip.x, right_hip.x) * w + 0.10 * w),
     )
     seg_top_y = max(0, int(top_head_y))
     seg_bot_y = min(h, int(bottom_foot_y))
 
     person_mask = segment_body_grabcut(img, x1, seg_top_y, x2, seg_bot_y)
     x_center_hint = int(((left_hip.x + right_hip.x) / 2.0) * w)
-    max_half_span = max(25, int(0.35 * w))
+    max_half_span = max(20, int(0.28 * w))
 
-    waist_y = int(0.56 * shoulder_y + 0.44 * hip_y)
+    waist_y = int(0.58 * shoulder_y + 0.42 * hip_y)
     fallback_waist_px = (
-        0.86 * hip_width_px if hip_width_px > 0 else 0.80 * shoulder_width_px
+        0.84 * hip_width_px if hip_width_px > 0 else 0.78 * shoulder_width_px
     )
 
-    # Outer garment & body calibration factors for realistic 2D-to-3D torso projection
-    shoulder_cal = 1.22
-    waist_cal = 1.38
-    hip_cal = 1.25
+    # Practical anthropometric calibration for front-view pose landmarks
+    shoulder_cal = 1.18
+    waist_cal = 1.24
+    hip_cal = 1.16
 
     measured_shoulder_px = measure_horizontal_width_px(
         person_mask=person_mask,
         y_pos=int(shoulder_y),
-        fallback_px=shoulder_width_px if shoulder_width_px > 0 else 80.0,
+        fallback_px=(shoulder_width_px if shoulder_width_px > 0 else 80.0) * shoulder_cal,
         x_center_hint=x_center_hint,
         max_half_span=max_half_span,
         min_px=20.0,
         max_px=float(w),
-    ) * shoulder_cal
-
+    )
     measured_waist_px = measure_horizontal_width_px(
         person_mask=person_mask,
         y_pos=waist_y,
-        fallback_px=fallback_waist_px if fallback_waist_px > 0 else 70.0,
+        fallback_px=(fallback_waist_px if fallback_waist_px > 0 else 70.0) * waist_cal,
         x_center_hint=x_center_hint,
         max_half_span=max_half_span,
         min_px=18.0,
         max_px=float(w),
-    ) * waist_cal
-
+    )
     measured_hip_px = measure_horizontal_width_px(
         person_mask=person_mask,
         y_pos=int(hip_y),
-        fallback_px=hip_width_px if hip_width_px > 0 else 75.0,
+        fallback_px=(hip_width_px if hip_width_px > 0 else 75.0) * hip_cal,
         x_center_hint=x_center_hint,
         max_half_span=max_half_span,
         min_px=20.0,
         max_px=float(w),
-    ) * hip_cal
+    )
 
-    shoulder_cm = measured_shoulder_px * cm_per_px
-    waist_width_cm = measured_waist_px * cm_per_px
-    hip_width_cm = measured_hip_px * cm_per_px
+    raw_shoulder_cm = measured_shoulder_px * cm_per_px
+    raw_waist_width_cm = measured_waist_px * cm_per_px
+    raw_hip_width_cm = measured_hip_px * cm_per_px
 
     height_m = max(height_cm / 100.0, 1.2)
     bmi = weight_kg / (height_m * height_m)
-    depth_scale = float(np.clip(0.68 + (bmi - 21.0) * 0.015, 0.62, 0.92))
+    depth_scale = float(np.clip(0.72 + (bmi - 20.0) * 0.012, 0.68, 0.88))
 
-    waist_depth_cm = waist_width_cm * depth_scale
-    hip_depth_cm = hip_width_cm * depth_scale
-    chest_width_cm = shoulder_cm * 0.95
+    waist_depth_cm = raw_waist_width_cm * depth_scale
+    hip_depth_cm = raw_hip_width_cm * depth_scale
+    chest_width_cm = raw_shoulder_cm * 0.94
     chest_depth_cm = chest_width_cm * depth_scale
 
-    chest_cm = ellipse_circumference_cm(chest_width_cm, chest_depth_cm)
-    waist_cm = ellipse_circumference_cm(waist_width_cm, waist_depth_cm)
-    hip_cm = ellipse_circumference_cm(hip_width_cm, hip_depth_cm)
+    raw_chest_cm = ellipse_circumference_cm(chest_width_cm, chest_depth_cm)
+    raw_waist_cm = ellipse_circumference_cm(raw_waist_width_cm, waist_depth_cm)
+    raw_hip_cm = ellipse_circumference_cm(raw_hip_width_cm, hip_depth_cm)
+
+    # Anthropometric prior anchor (height + weight/BMI) blended with pose measurements
+    prior_chest_cm = 0.42 * height_cm + 0.34 * weight_kg - 0.5
+    prior_waist_cm = 0.24 * height_cm + 0.44 * weight_kg - 0.8
+    prior_hip_cm = 0.32 * height_cm + 0.42 * weight_kg + 1.5
+
+    chest_cm = float(np.clip(0.55 * raw_chest_cm + 0.45 * prior_chest_cm, 78.0, 135.0))
+    waist_cm = float(np.clip(0.55 * raw_waist_cm + 0.45 * prior_waist_cm, 62.0, 125.0))
+    hip_cm = float(np.clip(0.55 * raw_hip_cm + 0.45 * prior_hip_cm, 78.0, 135.0))
+    shoulder_cm = float(np.clip(0.55 * raw_shoulder_cm + 0.45 * (chest_cm * 0.44), 34.0, 62.0))
 
     print(
         "DEBUG METRICS:",
         "conf=", confidence_pct,
-        "body_h_px=", round(body_height_px, 1),
-        "cm_per_px=", round(cm_per_px, 4),
-        "meas_sh_px=", round(measured_shoulder_px, 1),
-        "meas_w_px=", round(measured_waist_px, 1),
-        "chest_in=", round(chest_cm / 2.54, 1),
-        "waist_in=", round(waist_cm / 2.54, 1),
+        "bmi=", round(bmi, 1),
+        "raw_chest_in=", round(raw_chest_cm / 2.54, 1),
+        "raw_waist_in=", round(raw_waist_cm / 2.54, 1),
+        "final_chest_in=", round(chest_cm / 2.54, 1),
+        "final_waist_in=", round(waist_cm / 2.54, 1),
     )
 
     return {
