@@ -375,4 +375,9 @@ def extract_pose_metrics(
     key_points = [
         nose,
         left_shoulder,
-        right
+        right_shoulder,
+        left_hip,
+        right_hip,
+        left_ankle,
+        right_ankle,
+    ]
