@@ -600,8 +600,125 @@ async def predict_size(
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+@app.post("/api/skin-tone-analysis")
+async def skin_tone_analysis(file: UploadFile = File(...)):
+    try:
+        img_bytes = await file.read()
+        if not img_bytes:
+            raise HTTPException(status_code=400, detail="Image file required hai.")
 
+        nparr = np.frombuffer(img_bytes, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if img is None:
+            raise HTTPException(status_code=400, detail="Invalid image file.")
+
+        # Face/skin region crop (upper-center area) aur brightness/color balance
+        h, w, _ = img.shape
+        crop = img[int(h * 0.18):int(h * 0.62), int(w * 0.28):int(w * 0.72)]
+        if crop.size == 0:
+            crop = img
+
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        mean_v = float(hsv[:, :, 2].mean())  # Approximate brightness/value
+
+        mean_bgr = crop.mean(axis=(0, 1))  # B, G, R
+        b, g, r = float(mean_bgr[0]), float(mean_bgr[1]), float(mean_bgr[2])
+
+        # Depth/tone classification based on brightness
+        if mean_v >= 165:
+            tone_band = "Fair to Light"
+        elif mean_v >= 115:
+            tone_band = "Medium to Olive"
+        else:
+            tone_band = "Deep / Rich"
+
+        if (r - b) > 12:
+            undertone = f"Warm Undertone ({tone_band})"
+            colors = [
+                {
+                    "name": "Warm Olive & Moss Green",
+                    "hex": "#5A6B3C",
+                    "desc": "Warm undertones ke sath natural harmony banata hai aur smart casual look deta hai.",
+                },
+                {
+                    "name": "Terracotta & Rust Brown",
+                    "hex": "#B8502D",
+                    "desc": "Golden aur warm skin tones ko rich, confident depth deta hai.",
+                },
+                {
+                    "name": "Warm Ivory & Camel",
+                    "hex": "#E3C598",
+                    "desc": "Harsh contrast ke baghair clean aur refined appearance deta hai.",
+                },
+                {
+                    "name": "Deep Burgundy / Wine",
+                    "hex": "#6D213C",
+                    "desc": "Evening aur formal wear ke liye balanced aur classy option hai.",
+                },
+            ]
+        elif (b - r) > 8:
+            undertone = f"Cool Undertone ({tone_band})"
+            colors = [
+                {
+                    "name": "Classic Navy & Slate Blue",
+                    "hex": "#1E3A5F",
+                    "desc": "Cool undertones ke liye crisp, formal aur trustworthy palette hai.",
+                },
+                {
+                    "name": "Emerald & Pine Teal",
+                    "hex": "#15616D",
+                    "desc": "Skin tone ki clarity ko ubharta hai aur fresh look deta hai.",
+                },
+                {
+                    "name": "Crisp White & Cool Grey",
+                    "hex": "#D8DEE9",
+                    "desc": "Clean contrast ke sath modern aur sharp styling deta hai.",
+                },
+                {
+                    "name": "Plum & Berry Slate",
+                    "hex": "#5E3A5A",
+                    "desc": "Smart semi-formal outfits ke liye balanced accent shade hai.",
+                },
+            ]
+        else:
+            undertone = f"Neutral Undertone ({tone_band})"
+            colors = [
+                {
+                    "name": "Charcoal & Graphite Grey",
+                    "hex": "#363945",
+                    "desc": "Neutral skin tones par versatile, clean aur formal look deta hai.",
+                },
+                {
+                    "name": "Dusty Teal & Sage",
+                    "hex": "#3B6E6C",
+                    "desc": "Balanced undertones ke sath calm aur polished contrast banata hai.",
+                },
+                {
+                    "name": "Soft Rose & Mauve",
+                    "hex": "#A84A6A",
+                    "desc": "App ke signature aesthetic ke sath subtle aur stylish match hai.",
+                },
+                {
+                    "name": "Warm Sand & Taupe",
+                    "hex": "#9C846E",
+                    "desc": "Everyday wear ke liye effortless aur cohesive tone deta hai.",
+                },
+            ]
+
+        return JSONResponse(
+            content={
+                "status": "success",
+                "detected_undertone": undertone,
+                "recommended_colors": colors,
+            }
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
+
