@@ -129,25 +129,16 @@ def _run_fashn_tryon(
 
 
 # ==========================================
-# ELLIPSE CIRCUMFERENCE
+# ELLIPSE CIRCUMFERENCE (RAMANUJAN II)
 # ==========================================
 
-def ellipse_circumference_cm(
-    width_cm: float,
-    depth_cm: float
-) -> float:
+def ellipse_circumference_cm(width_cm: float, depth_cm: float) -> float:
     a = max(width_cm / 2.0, 0.1)
     b = max(depth_cm / 2.0, 0.1)
-
     h = ((a - b) ** 2) / ((a + b) ** 2)
-
-    circumference = math.pi * (a + b) * (
-        1.0 +
-        (3.0 * h) /
-        (10.0 + math.sqrt(max(0.0, 4.0 - 3.0 * h)))
+    return math.pi * (a + b) * (
+        1.0 + (3.0 * h) / (10.0 + math.sqrt(max(0.0, 4.0 - 3.0 * h)))
     )
-
-    return circumference
 
 
 # ==========================================
@@ -228,7 +219,7 @@ async def try_on(
 
 
 # ==========================================
-# MEDIAPIPE POSE + SEGMENTATION (MEMORY SAFE)
+# MEDIAPIPE POSE + GRABCUT (480PX MEMORY SAFE)
 # ==========================================
 
 mp_pose = mp.solutions.pose
@@ -281,7 +272,7 @@ def segment_body_grabcut(
             cv2.GC_INIT_WITH_RECT
         )
         person_mask = np.where(
-            mask == cv2.GC_FGD,
+            (mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD),
             255,
             0
         ).astype(np.uint8)
@@ -348,18 +339,101 @@ def measure_horizontal_width_px(
     if best_span is None:
         return safe_fallback
 
-    if best_span > safe_fallback * 1.45:
+    if best_span > safe_fallback * 1.40 or best_span < safe_fallback * 0.65:
         best_span = safe_fallback
 
-    blended = 0.45 * best_span + 0.55 * safe_fallback
+    blended = 0.50 * best_span + 0.50 * safe_fallback
     return float(np.clip(blended, min_px, max_px))
+
+
+def _measure_side_depth_cm(
+    side_bytes: Optional[bytes],
+    height_cm: float
+) -> Optional[tuple[float, float]]:
+    """Side-view image + grabCut se chest aur waist ki front-to-back depth (cm) nikalta hai."""
+    if not side_bytes:
+        return None
+    try:
+        nparr = np.frombuffer(side_bytes, np.uint8)
+        raw_img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        del nparr
+        if raw_img is None:
+            return None
+
+        img = _resize_for_processing(raw_img, max_dim=480)
+        del raw_img
+
+        h, w, _ = img.shape
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        res = pose.process(img_rgb)
+        del img_rgb
+
+        if not res.pose_landmarks:
+            del img
+            return None
+
+        lm = res.pose_landmarks.landmark
+        nose = lm[mp_pose.PoseLandmark.NOSE]
+        l_sh = lm[mp_pose.PoseLandmark.LEFT_SHOULDER]
+        r_sh = lm[mp_pose.PoseLandmark.RIGHT_SHOULDER]
+        l_hip = lm[mp_pose.PoseLandmark.LEFT_HIP]
+        r_hip = lm[mp_pose.PoseLandmark.RIGHT_HIP]
+        l_ank = lm[mp_pose.PoseLandmark.LEFT_ANKLE]
+        r_ank = lm[mp_pose.PoseLandmark.RIGHT_ANKLE]
+
+        nose_y = nose.y * h
+        sh_y = ((l_sh.y + r_sh.y) / 2.0) * h
+        hip_y = ((l_hip.y + r_hip.y) / 2.0) * h
+        ank_y = ((l_ank.y + r_ank.y) / 2.0) * h
+
+        top_y = max(0.0, nose_y - 0.11 * h)
+        bot_y = min(float(h), ank_y + 0.03 * h)
+        body_h_px = max(20.0, bot_y - top_y)
+        cm_per_px = height_cm / body_h_px
+
+        center_x = int((((l_sh.x + r_sh.x + l_hip.x + r_hip.x) / 4.0)) * w)
+        x1 = max(0, center_x - int(0.18 * w))
+        x2 = min(w, center_x + int(0.18 * w))
+
+        side_mask = segment_body_grabcut(img, x1, int(top_y), x2, int(bot_y))
+        del img
+
+        if side_mask is None:
+            return None
+
+        chest_y = int(sh_y + 0.28 * (hip_y - sh_y))
+        waist_y = int(sh_y + 0.65 * (hip_y - sh_y))
+
+        chest_depth_px = measure_horizontal_width_px(
+            person_mask=side_mask,
+            y_pos=chest_y,
+            fallback_px=22.0 / max(cm_per_px, 0.05),
+            x_center_hint=center_x,
+            max_half_span=max(15, int(0.18 * w)),
+            min_px=10.0,
+            max_px=float(w) * 0.45,
+        )
+        waist_depth_px = measure_horizontal_width_px(
+            person_mask=side_mask,
+            y_pos=waist_y,
+            fallback_px=20.0 / max(cm_per_px, 0.05),
+            x_center_hint=center_x,
+            max_half_span=max(15, int(0.18 * w)),
+            min_px=10.0,
+            max_px=float(w) * 0.45,
+        )
+        del side_mask
+
+        return (chest_depth_px * cm_per_px, waist_depth_px * cm_per_px)
+    except Exception:
+        return None
 
 
 def extract_pose_metrics(
     image_bytes: bytes,
     height_cm: float,
     weight_kg: float,
-    has_side_view: bool = False,
+    side_bytes: Optional[bytes] = None,
 ):
     nparr = np.frombuffer(image_bytes, np.uint8)
     raw_img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
@@ -422,8 +496,7 @@ def extract_pose_metrics(
 
     top_head_y = max(0.0, nose_y - 0.11 * h)
     bottom_foot_y = min(float(h), ankle_y + 0.03 * h)
-    body_height_px = max(10.0, bottom_foot_y - top_head_y)
-
+    body_height_px = max(20.0, bottom_foot_y - top_head_y)
     cm_per_px = height_cm / body_height_px
 
     shoulder_width_px = abs(left_shoulder.x - right_shoulder.x) * w
@@ -444,14 +517,20 @@ def extract_pose_metrics(
     x_center_hint = int(((left_hip.x + right_hip.x) / 2.0) * w)
     max_half_span = max(20, int(0.28 * w))
 
-    waist_y = int(0.58 * shoulder_y + 0.42 * hip_y)
-    fallback_waist_px = (
-        0.84 * hip_width_px if hip_width_px > 0 else 0.78 * shoulder_width_px
-    )
+    chest_y = int(shoulder_y + 0.26 * (hip_y - shoulder_y))
+    waist_y = int(shoulder_y + 0.64 * (hip_y - shoulder_y))
 
-    shoulder_cal = 1.15
-    waist_cal = 1.48
-    hip_cal = 1.18
+    height_m = max(height_cm / 100.0, 1.2)
+    bmi = weight_kg / (height_m * height_m)
+
+    shoulder_cal = float(np.clip(1.14 + (bmi - 20.0) * 0.007, 1.08, 1.25))
+    hip_cal = float(np.clip(1.22 + (bmi - 20.0) * 0.009, 1.15, 1.36))
+    taper = float(np.clip(0.84 + (bmi - 20.0) * 0.011, 0.76, 0.98))
+    fallback_waist_px = (
+        (hip_width_px * hip_cal * taper)
+        if hip_width_px > 0
+        else (shoulder_width_px * 0.80)
+    )
 
     measured_shoulder_px = measure_horizontal_width_px(
         person_mask=person_mask,
@@ -462,13 +541,22 @@ def extract_pose_metrics(
         min_px=20.0,
         max_px=float(w),
     )
-    measured_waist_px = measure_horizontal_width_px(
+    measured_chest_px = measure_horizontal_width_px(
         person_mask=person_mask,
-        y_pos=waist_y,
-        fallback_px=(fallback_waist_px if fallback_waist_px > 0 else 70.0) * waist_cal,
+        y_pos=chest_y,
+        fallback_px=measured_shoulder_px * 0.88,
         x_center_hint=x_center_hint,
         max_half_span=max_half_span,
         min_px=18.0,
+        max_px=float(w),
+    )
+    measured_waist_px = measure_horizontal_width_px(
+        person_mask=person_mask,
+        y_pos=waist_y,
+        fallback_px=(fallback_waist_px if fallback_waist_px > 0 else 65.0),
+        x_center_hint=x_center_hint,
+        max_half_span=max_half_span,
+        min_px=16.0,
         max_px=float(w),
     )
     measured_hip_px = measure_horizontal_width_px(
@@ -487,53 +575,58 @@ def extract_pose_metrics(
     gc.collect()
 
     raw_shoulder_cm = measured_shoulder_px * cm_per_px
+    raw_chest_width_cm = measured_chest_px * cm_per_px
     raw_waist_width_cm = measured_waist_px * cm_per_px
     raw_hip_width_cm = measured_hip_px * cm_per_px
 
-    height_m = max(height_cm / 100.0, 1.2)
-    bmi = weight_kg / (height_m * height_m)
-    depth_scale = float(np.clip(0.72 + (bmi - 20.0) * 0.012, 0.68, 0.88))
+    # Torso depth from BMI + optional Side View GrabCut measurement
+    depth_scale = float(np.clip(0.68 + (bmi - 20.0) * 0.012, 0.62, 0.86))
+    est_chest_depth_cm = raw_chest_width_cm * depth_scale
+    est_waist_depth_cm = raw_waist_width_cm * (depth_scale * 0.98)
+    est_hip_depth_cm = raw_hip_width_cm * depth_scale
 
-    waist_depth_cm = raw_waist_width_cm * depth_scale
-    hip_depth_cm = raw_hip_width_cm * depth_scale
-    chest_width_cm = raw_shoulder_cm * 0.92
-    chest_depth_cm = chest_width_cm * depth_scale
+    side_depths = _measure_side_depth_cm(side_bytes, height_cm)
+    has_side_view = side_depths is not None
+    if side_depths is not None:
+        side_chest_d, side_waist_d = side_depths
+        side_chest_d = float(np.clip(side_chest_d, est_chest_depth_cm * 0.78, est_chest_depth_cm * 1.22))
+        side_waist_d = float(np.clip(side_waist_d, est_waist_depth_cm * 0.78, est_waist_depth_cm * 1.22))
+        est_chest_depth_cm = 0.55 * est_chest_depth_cm + 0.45 * side_chest_d
+        est_waist_depth_cm = 0.55 * est_waist_depth_cm + 0.45 * side_waist_d
 
-    raw_chest_cm = ellipse_circumference_cm(chest_width_cm, chest_depth_cm)
-    raw_waist_cm = ellipse_circumference_cm(raw_waist_width_cm, waist_depth_cm)
-    raw_hip_cm = ellipse_circumference_cm(raw_hip_width_cm, hip_depth_cm)
+    raw_chest_cm = ellipse_circumference_cm(raw_chest_width_cm, est_chest_depth_cm)
+    raw_waist_cm = ellipse_circumference_cm(raw_waist_width_cm, est_waist_depth_cm)
+    raw_hip_cm = ellipse_circumference_cm(raw_hip_width_cm, est_hip_depth_cm)
 
-    bmi_adj = float(np.clip((bmi - 20.0) * 1.4, -5.0, 12.0))
-    prior_chest_cm = 0.36 * height_cm + 0.38 * weight_kg + 5.5 + bmi_adj
-    prior_waist_cm = 0.26 * height_cm + 0.46 * weight_kg + 1.5 + (bmi_adj * 1.1)
-    prior_hip_cm = 0.30 * height_cm + 0.44 * weight_kg + 6.0 + bmi_adj
+    # Calibrated Anthropometric Regression (no 70cm floor lock; responsive to height & weight)
+    anthro_chest_cm = 0.24 * height_cm + 0.62 * weight_kg + 13.5
+    anthro_waist_cm = 0.14 * height_cm + 0.68 * weight_kg + 12.2
+    anthro_hip_cm = 0.22 * height_cm + 0.60 * weight_kg + 22.5
+    anthro_shoulder_cm = 0.17 * height_cm + 0.21 * weight_kg + 3.2
 
-    chest_cm = float(np.clip(0.40 * raw_chest_cm + 0.60 * prior_chest_cm, 76.0, 134.0))
-    waist_cm = float(np.clip(0.35 * raw_waist_cm + 0.65 * prior_waist_cm, 70.0, 122.0))
-    hip_cm = float(np.clip(0.40 * raw_hip_cm + 0.60 * prior_hip_cm, 84.0, 132.0))
-    shoulder_cm = float(np.clip(0.45 * raw_shoulder_cm + 0.55 * (chest_cm * 0.44), 36.0, 60.0))
+    # Bound loose clothing / camera perspective distortion within +/- 6.5 cm of anthropometric baseline
+    raw_chest_cm = float(np.clip(raw_chest_cm, anthro_chest_cm - 6.5, anthro_chest_cm + 6.5))
+    raw_waist_cm = float(np.clip(raw_waist_cm, anthro_waist_cm - 6.0, anthro_waist_cm + 6.0))
+    raw_hip_cm = float(np.clip(raw_hip_cm, anthro_hip_cm - 6.5, anthro_hip_cm + 6.5))
+    raw_shoulder_cm = float(np.clip(raw_shoulder_cm, anthro_shoulder_cm - 3.5, anthro_shoulder_cm + 3.5))
+
+    # Fuse GrabCut + Pose circumference (35%) with calibrated anthropometric model (65%)
+    chest_cm = float(np.clip(0.35 * raw_chest_cm + 0.65 * anthro_chest_cm, 72.0, 148.0))
+    waist_cm = float(np.clip(0.35 * raw_waist_cm + 0.65 * anthro_waist_cm, 58.0, 140.0))
+    hip_cm = float(np.clip(0.35 * raw_hip_cm + 0.65 * anthro_hip_cm, 74.0, 148.0))
+    shoulder_cm = float(np.clip(0.40 * raw_shoulder_cm + 0.60 * anthro_shoulder_cm, 34.0, 62.0))
 
     shoulder_tilt = abs(left_shoulder.y - right_shoulder.y)
     hip_tilt = abs(left_hip.y - right_hip.y)
-    tilt_penalty = min(9.0, (shoulder_tilt + hip_tilt) * 90.0)
+    tilt_penalty = min(8.0, (shoulder_tilt + hip_tilt) * 85.0)
 
-    chest_diff_in = abs((raw_chest_cm - prior_chest_cm) / 2.54)
-    waist_diff_in = abs((raw_waist_cm - prior_waist_cm) / 2.54)
-    consistency_penalty = min(14.0, (chest_diff_in * 1.4 + waist_diff_in * 1.4))
+    chest_diff_in = abs((raw_chest_cm - anthro_chest_cm) / 2.54)
+    waist_diff_in = abs((raw_waist_cm - anthro_waist_cm) / 2.54)
+    consistency_penalty = min(10.0, (chest_diff_in + waist_diff_in) * 1.2)
 
-    side_bonus = 2.0 if has_side_view else -2.5
-    raw_conf = (avg_vis * 94.0) - tilt_penalty - consistency_penalty + side_bonus
-    confidence_pct = round(float(np.clip(raw_conf, 62.0, 96.4)), 1)
-
-    print(
-        "DEBUG METRICS:",
-        "conf=", confidence_pct,
-        "bmi=", round(bmi, 1),
-        "raw_chest_in=", round(raw_chest_cm / 2.54, 1),
-        "raw_waist_in=", round(raw_waist_cm / 2.54, 1),
-        "final_chest_in=", round(chest_cm / 2.54, 1),
-        "final_waist_in=", round(waist_cm / 2.54, 1),
-    )
+    side_bonus = 2.5 if has_side_view else -1.5
+    raw_conf = (avg_vis * 95.0) - tilt_penalty - consistency_penalty + side_bonus
+    confidence_pct = round(float(np.clip(raw_conf, 72.0, 97.5)), 1)
 
     return {
         "shoulder_cm": round(shoulder_cm, 1),
@@ -550,28 +643,30 @@ def extract_pose_metrics(
 def _pant_size_from_waist_inches(waist_in: float) -> str:
     if waist_in < 28.0:
         return "XS"
-    elif waist_in <= 29.0:
+    elif waist_in <= 29.5:
         return "Small"
-    elif waist_in <= 32.0:
+    elif waist_in <= 32.5:
         return "M"
-    elif waist_in <= 35.0:
+    elif waist_in <= 35.5:
         return "Large"
-    elif waist_in <= 38.0:
+    elif waist_in <= 38.5:
         return "L"
-    else:
+    elif waist_in <= 42.5:
         return "XL"
+    else:
+        return "XXL"
 
 
 def _shirt_size_from_chest_inches(chest_in: float) -> str:
-    if chest_in <= 32.0:
+    if chest_in < 34.0:
         return "XS"
-    elif chest_in <= 35.0:
+    elif chest_in <= 36.5:
         return "S"
-    elif chest_in <= 38.0:
+    elif chest_in <= 39.5:
         return "M"
-    elif chest_in <= 42.0:
+    elif chest_in <= 42.5:
         return "L"
-    elif chest_in <= 47.0:
+    elif chest_in <= 46.0:
         return "XL"
     else:
         return "XXL"
@@ -585,23 +680,34 @@ async def predict_size(
     weight_kg: float = Form(...),
 ):
     try:
+        if height_cm < 120 or height_cm > 230:
+            raise HTTPException(
+                status_code=400,
+                detail="Height 120 cm se 230 cm ke darmiyan honi chahiye."
+            )
+        if weight_kg < 30 or weight_kg > 200:
+            raise HTTPException(
+                status_code=400,
+                detail="Weight 30 kg se 200 kg ke darmiyan hona chahiye."
+            )
+
         front_bytes = await image.read()
         if not front_bytes:
             raise HTTPException(status_code=400, detail="Front photo required hai.")
 
-        has_side = False
+        side_bytes = None
         if side_image is not None:
-            side_bytes = await side_image.read()
-            has_side = bool(side_bytes)
-            del side_bytes
+            raw_side = await side_image.read()
+            if raw_side:
+                side_bytes = raw_side
 
         metrics, confidence_pct, err = extract_pose_metrics(
             front_bytes,
             height_cm,
             weight_kg,
-            has_side_view=has_side,
+            side_bytes=side_bytes,
         )
-        del front_bytes
+        del front_bytes, side_bytes
 
         if err or metrics is None:
             raise HTTPException(status_code=400, detail=err or "Pose detection failed.")
