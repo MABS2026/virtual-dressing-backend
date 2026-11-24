@@ -240,7 +240,7 @@ pose = mp_pose.Pose(
 )
 
 
-def _resize_for_processing(img: np.ndarray, max_dim: int = 640) -> np.ndarray:
+def _resize_for_processing(img: np.ndarray, max_dim: int = 480) -> np.ndarray:
     h, w, _ = img.shape
     largest = max(h, w)
     if largest <= max_dim:
@@ -368,7 +368,7 @@ def extract_pose_metrics(
     if raw_img is None:
         return None, 0.0, "Invalid image file"
 
-    img = _resize_for_processing(raw_img, max_dim=640)
+    img = _resize_for_processing(raw_img, max_dim=480)
     del raw_img
 
     h, w, _ = img.shape
@@ -648,7 +648,7 @@ async def skin_tone_analysis(file: UploadFile = File(...)):
         if raw_img is None:
             raise HTTPException(status_code=400, detail="Invalid image file.")
 
-        img = _resize_for_processing(raw_img, max_dim=640)
+        img = _resize_for_processing(raw_img, max_dim=480)
         del raw_img
 
         h, w, _ = img.shape
