@@ -410,4 +410,355 @@ def extract_pose_metrics(
             gc.collect()
             return None, 0.0, (
                 "Some body parts aren't clearly visible. "
-                "Please keep
+                "Please keep your full body (head to toe) inside the frame."
+            )
+
+    avg_vis = sum(pt.visibility for pt in key_points) / len(key_points)
+
+    nose_y = nose.y * h
+    shoulder_y = ((left_shoulder.y + right_shoulder.y) / 2.0) * h
+    hip_y = ((left_hip.y + right_hip.y) / 2.0) * h
+    ankle_y = ((left_ankle.y + right_ankle.y) / 2.0) * h
+
+    top_head_y = max(0.0, nose_y - 0.11 * h)
+    bottom_foot_y = min(float(h), ankle_y + 0.03 * h)
+    body_height_px = max(10.0, bottom_foot_y - top_head_y)
+
+    cm_per_px = height_cm / body_height_px
+
+    shoulder_width_px = abs(left_shoulder.x - right_shoulder.x) * w
+    hip_width_px = abs(left_hip.x - right_hip.x) * w
+
+    x1 = max(
+        0,
+        int(min(left_shoulder.x, right_shoulder.x, left_hip.x, right_hip.x) * w - 0.10 * w),
+    )
+    x2 = min(
+        w,
+        int(max(left_shoulder.x, right_shoulder.x, left_hip.x, right_hip.x) * w + 0.10 * w),
+    )
+    seg_top_y = max(0, int(top_head_y))
+    seg_bot_y = min(h, int(bottom_foot_y))
+
+    person_mask = segment_body_grabcut(img, x1, seg_top_y, x2, seg_bot_y)
+    x_center_hint = int(((left_hip.x + right_hip.x) / 2.0) * w)
+    max_half_span = max(20, int(0.28 * w))
+
+    waist_y = int(0.58 * shoulder_y + 0.42 * hip_y)
+    fallback_waist_px = (
+        0.84 * hip_width_px if hip_width_px > 0 else 0.78 * shoulder_width_px
+    )
+
+    shoulder_cal = 1.15
+    waist_cal = 1.48
+    hip_cal = 1.18
+
+    measured_shoulder_px = measure_horizontal_width_px(
+        person_mask=person_mask,
+        y_pos=int(shoulder_y),
+        fallback_px=(shoulder_width_px if shoulder_width_px > 0 else 80.0) * shoulder_cal,
+        x_center_hint=x_center_hint,
+        max_half_span=max_half_span,
+        min_px=20.0,
+        max_px=float(w),
+    )
+    measured_waist_px = measure_horizontal_width_px(
+        person_mask=person_mask,
+        y_pos=waist_y,
+        fallback_px=(fallback_waist_px if fallback_waist_px > 0 else 70.0) * waist_cal,
+        x_center_hint=x_center_hint,
+        max_half_span=max_half_span,
+        min_px=18.0,
+        max_px=float(w),
+    )
+    measured_hip_px = measure_horizontal_width_px(
+        person_mask=person_mask,
+        y_pos=int(hip_y),
+        fallback_px=(hip_width_px if hip_width_px > 0 else 75.0) * hip_cal,
+        x_center_hint=x_center_hint,
+        max_half_span=max_half_span,
+        min_px=20.0,
+        max_px=float(w),
+    )
+
+    if person_mask is not None:
+        del person_mask
+    del img
+    gc.collect()
+
+    raw_shoulder_cm = measured_shoulder_px * cm_per_px
+    raw_waist_width_cm = measured_waist_px * cm_per_px
+    raw_hip_width_cm = measured_hip_px * cm_per_px
+
+    height_m = max(height_cm / 100.0, 1.2)
+    bmi = weight_kg / (height_m * height_m)
+    depth_scale = float(np.clip(0.72 + (bmi - 20.0) * 0.012, 0.68, 0.88))
+
+    waist_depth_cm = raw_waist_width_cm * depth_scale
+    hip_depth_cm = raw_hip_width_cm * depth_scale
+    chest_width_cm = raw_shoulder_cm * 0.92
+    chest_depth_cm = chest_width_cm * depth_scale
+
+    raw_chest_cm = ellipse_circumference_cm(chest_width_cm, chest_depth_cm)
+    raw_waist_cm = ellipse_circumference_cm(raw_waist_width_cm, waist_depth_cm)
+    raw_hip_cm = ellipse_circumference_cm(raw_hip_width_cm, hip_depth_cm)
+
+    bmi_adj = float(np.clip((bmi - 20.0) * 1.4, -5.0, 12.0))
+    prior_chest_cm = 0.36 * height_cm + 0.38 * weight_kg + 5.5 + bmi_adj
+    prior_waist_cm = 0.26 * height_cm + 0.46 * weight_kg + 1.5 + (bmi_adj * 1.1)
+    prior_hip_cm = 0.30 * height_cm + 0.44 * weight_kg + 6.0 + bmi_adj
+
+    chest_cm = float(np.clip(0.40 * raw_chest_cm + 0.60 * prior_chest_cm, 76.0, 134.0))
+    waist_cm = float(np.clip(0.35 * raw_waist_cm + 0.65 * prior_waist_cm, 70.0, 122.0))
+    hip_cm = float(np.clip(0.40 * raw_hip_cm + 0.60 * prior_hip_cm, 84.0, 132.0))
+    shoulder_cm = float(np.clip(0.45 * raw_shoulder_cm + 0.55 * (chest_cm * 0.44), 36.0, 60.0))
+
+    shoulder_tilt = abs(left_shoulder.y - right_shoulder.y)
+    hip_tilt = abs(left_hip.y - right_hip.y)
+    tilt_penalty = min(9.0, (shoulder_tilt + hip_tilt) * 90.0)
+
+    chest_diff_in = abs((raw_chest_cm - prior_chest_cm) / 2.54)
+    waist_diff_in = abs((raw_waist_cm - prior_waist_cm) / 2.54)
+    consistency_penalty = min(14.0, (chest_diff_in * 1.4 + waist_diff_in * 1.4))
+
+    side_bonus = 2.0 if has_side_view else -2.5
+    raw_conf = (avg_vis * 94.0) - tilt_penalty - consistency_penalty + side_bonus
+    confidence_pct = round(float(np.clip(raw_conf, 62.0, 96.4)), 1)
+
+    print(
+        "DEBUG METRICS:",
+        "conf=", confidence_pct,
+        "bmi=", round(bmi, 1),
+        "raw_chest_in=", round(raw_chest_cm / 2.54, 1),
+        "raw_waist_in=", round(raw_waist_cm / 2.54, 1),
+        "final_chest_in=", round(chest_cm / 2.54, 1),
+        "final_waist_in=", round(waist_cm / 2.54, 1),
+    )
+
+    return {
+        "shoulder_cm": round(shoulder_cm, 1),
+        "chest_cm": round(chest_cm, 1),
+        "waist_cm": round(waist_cm, 1),
+        "hip_cm": round(hip_cm, 1),
+        "chest_inches": round(chest_cm / 2.54, 1),
+        "waist_inches": round(waist_cm / 2.54, 1),
+        "hip_inches": round(hip_cm / 2.54, 1),
+        "shoulder_inches": round(shoulder_cm / 2.54, 1),
+    }, confidence_pct, None
+
+
+def _pant_size_from_waist_inches(waist_in: float) -> str:
+    if waist_in < 28.0:
+        return "XS"
+    elif waist_in <= 29.0:
+        return "Small"
+    elif waist_in <= 32.0:
+        return "M"
+    elif waist_in <= 35.0:
+        return "Large"
+    elif waist_in <= 38.0:
+        return "L"
+    else:
+        return "XL"
+
+
+def _shirt_size_from_chest_inches(chest_in: float) -> str:
+    if chest_in <= 32.0:
+        return "XS"
+    elif chest_in <= 35.0:
+        return "S"
+    elif chest_in <= 38.0:
+        return "M"
+    elif chest_in <= 42.0:
+        return "L"
+    elif chest_in <= 47.0:
+        return "XL"
+    else:
+        return "XXL"
+
+
+@app.post("/api/predict-size")
+async def predict_size(
+    image: UploadFile = File(...),
+    side_image: Optional[UploadFile] = File(None),
+    height_cm: float = Form(...),
+    weight_kg: float = Form(...),
+):
+    try:
+        front_bytes = await image.read()
+        if not front_bytes:
+            raise HTTPException(status_code=400, detail="Front photo required hai.")
+
+        has_side = False
+        if side_image is not None:
+            side_bytes = await side_image.read()
+            has_side = bool(side_bytes)
+            del side_bytes
+
+        metrics, confidence_pct, err = extract_pose_metrics(
+            front_bytes,
+            height_cm,
+            weight_kg,
+            has_side_view=has_side,
+        )
+        del front_bytes
+
+        if err or metrics is None:
+            raise HTTPException(status_code=400, detail=err or "Pose detection failed.")
+
+        chest_in = metrics["chest_inches"]
+        waist_in = metrics["waist_inches"]
+
+        shirt_size = _shirt_size_from_chest_inches(chest_in)
+        pant_size = _pant_size_from_waist_inches(waist_in)
+
+        return JSONResponse(
+            content={
+                "status": "success",
+                "height_cm": round(height_cm, 1),
+                "weight_kg": round(weight_kg, 1),
+                "confidence": confidence_pct,
+                "confidence_percentage": confidence_pct,
+                "measurements": metrics,
+                "recommended_shirt_size": shirt_size,
+                "recommended_pant_size": pant_size,
+                "recommended_size": shirt_size,
+            }
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        gc.collect()
+
+
+@app.post("/api/skin-tone-analysis")
+async def skin_tone_analysis(file: UploadFile = File(...)):
+    try:
+        img_bytes = await file.read()
+        if not img_bytes:
+            raise HTTPException(status_code=400, detail="Image file required hai.")
+
+        nparr = np.frombuffer(img_bytes, np.uint8)
+        raw_img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        del nparr, img_bytes
+
+        if raw_img is None:
+            raise HTTPException(status_code=400, detail="Invalid image file.")
+
+        img = _resize_for_processing(raw_img, max_dim=640)
+        del raw_img
+
+        h, w, _ = img.shape
+        crop = img[int(h * 0.18):int(h * 0.62), int(w * 0.28):int(w * 0.72)]
+        if crop.size == 0:
+            crop = img
+
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        mean_v = float(hsv[:, :, 2].mean())
+
+        mean_bgr = crop.mean(axis=(0, 1))
+        b, g, r = float(mean_bgr[0]), float(mean_bgr[1]), float(mean_bgr[2])
+        del hsv, crop, img
+
+        if mean_v >= 165:
+            tone_band = "Fair to Light"
+        elif mean_v >= 115:
+            tone_band = "Medium to Olive"
+        else:
+            tone_band = "Deep / Rich"
+
+        if (r - b) > 12:
+            undertone = f"Warm Undertone ({tone_band})"
+            colors = [
+                {
+                    "name": "Warm Olive & Moss Green",
+                    "hex": "#5A6B3C",
+                    "desc": "Warm undertones ke sath natural harmony banata hai aur smart casual look deta hai.",
+                },
+                {
+                    "name": "Terracotta & Rust Brown",
+                    "hex": "#B8502D",
+                    "desc": "Golden aur warm skin tones ko rich, confident depth deta hai.",
+                },
+                {
+                    "name": "Warm Ivory & Camel",
+                    "hex": "#E3C598",
+                    "desc": "Harsh contrast ke baghair clean aur refined appearance deta hai.",
+                },
+                {
+                    "name": "Deep Burgundy / Wine",
+                    "hex": "#6D213C",
+                    "desc": "Evening aur formal wear ke liye balanced aur classy option hai.",
+                },
+            ]
+        elif (b - r) > 8:
+            undertone = f"Cool Undertone ({tone_band})"
+            colors = [
+                {
+                    "name": "Classic Navy & Slate Blue",
+                    "hex": "#1E3A5F",
+                    "desc": "Cool undertones ke liye crisp, formal aur trustworthy palette hai.",
+                },
+                {
+                    "name": "Emerald & Pine Teal",
+                    "hex": "#15616D",
+                    "desc": "Skin tone ki clarity ko ubharta hai aur fresh look deta hai.",
+                },
+                {
+                    "name": "Crisp White & Cool Grey",
+                    "hex": "#D8DEE9",
+                    "desc": "Clean contrast ke sath modern aur sharp styling deta hai.",
+                },
+                {
+                    "name": "Plum & Berry Slate",
+                    "hex": "#5E3A5A",
+                    "desc": "Smart semi-formal outfits ke liye balanced accent shade hai.",
+                },
+            ]
+        else:
+            undertone = f"Neutral Undertone ({tone_band})"
+            colors = [
+                {
+                    "name": "Charcoal & Graphite Grey",
+                    "hex": "#363945",
+                    "desc": "Neutral skin tones par versatile, clean aur formal look deta hai.",
+                },
+                {
+                    "name": "Dusty Teal & Sage",
+                    "hex": "#3B6E6C",
+                    "desc": "Balanced undertones ke sath calm aur polished contrast banata hai.",
+                },
+                {
+                    "name": "Soft Rose & Mauve",
+                    "hex": "#A84A6A",
+                    "desc": "App ke signature aesthetic ke sath subtle aur stylish match hai.",
+                },
+                {
+                    "name": "Warm Sand & Taupe",
+                    "hex": "#9C846E",
+                    "desc": "Everyday wear ke liye effortless aur cohesive tone deta hai.",
+                },
+            ]
+
+        return JSONResponse(
+            content={
+                "status": "success",
+                "detected_undertone": undertone,
+                "recommended_colors": colors,
+            }
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        gc.collect()
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
